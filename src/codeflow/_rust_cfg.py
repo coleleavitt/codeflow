@@ -3,6 +3,7 @@
 import json
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import tomllib
@@ -17,8 +18,11 @@ DRIVER_COMMIT = DRIVER.with_name(DRIVER.name + ".commit")
 def _run(cmd: list[str], cwd: pathlib.Path, env: dict | None = None) -> str:
     proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
     if proc.returncode != 0:
-        tail = "\n".join(proc.stderr.splitlines()[-40:])
-        raise RuntimeError(f"{' '.join(cmd)} failed ({proc.returncode}):\n{tail}")
+        lines = proc.stderr.splitlines()
+        # The driver's own explanation (no match, ambiguous, several closures) leads the error.
+        reasons = [line.strip() for line in lines if "codeflow:" in line]
+        tail = "\n".join(lines[-40:])
+        raise RuntimeError("\n".join(reasons) + ("\n" if reasons else "") + f"{' '.join(cmd)} failed ({proc.returncode}):\n{tail}")
     return proc.stdout
 
 
@@ -63,7 +67,8 @@ def rust_cfg(file: pathlib.Path, function: str | int) -> dict:
         out = pathlib.Path(tmp) / "cfg.json"
         env = os.environ | {
             "RUSTC_WORKSPACE_WRAPPER": str(driver),
-            "CODEFLOW_LINE" if isinstance(function, int) else "CODEFLOW_FN": str(function),
+            # An int, or "LINE:COL" (between closures on one line), selects by position; else by name.
+            "CODEFLOW_LINE" if isinstance(function, int) or re.fullmatch(r"\d+:\d+", str(function)) else "CODEFLOW_FN": str(function),
             "CODEFLOW_FILE": str(file),
             "CODEFLOW_OUT": str(out),
             "CARGO_TARGET_DIR": str(workspace / "target" / "codeflow"),

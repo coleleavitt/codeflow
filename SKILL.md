@@ -14,7 +14,7 @@ print(await codeflow.cfg("ggml/src/ggml.c", 1778))                              
 print(await codeflow.cfg("src/server.py", "handle", follow=1))                            # plus each project callee's graph
 ```
 
-`cfg(path, function_or_line, *, level="source", cleanup=False, follow=0)` (.py, .js/.mjs/.cjs, .ts/.tsx/.mts/.cts, .c/.h/.cc/.cpp, .rs)
+`cfg(path, function_or_line, *, level="source", cleanup=False, follow=0, follow_limit=20)` (.py, .js/.mjs/.cjs, .ts/.tsx/.mts/.cts, .c/.h/.cc/.cpp, .rs)
 prints one line per block: `B3  :1081  if <condition>` with its edges
 (`true → B4`, `loop`, `done`, `exception`, `return`, `then re-raise`, `case X`, `goto L`; `↺` a loop back-edge,
 `← B1, B2` where paths join). Python `finally`, JS `finally`, C `goto`/`switch` fall-through and C++ `try` are
@@ -65,14 +65,17 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
   JS ask the type checker which call statements never return (pyright `NoReturn`/`Never`, tsgo `never`), falling
   back to known names (`sys.exit`, `os._exit`, `process.exit`) and same-file `NoReturn` annotations. Untyped helpers
   too: a called function whose own graph has no normal return (it always raises, throws or exits) ends its caller's
-  path ("+ callee graphs" in the header; one level deep, definitions from the language server or the same file).
+  path ("+ callee graphs" in the header; three levels deep, so `fatal()` → `bail()` → `sys.exit()` counts; definitions
+  from the language server or the same file; a recursive helper counts as returning).
 - Rust branch labels: each MIR branch tests one operand, so `a || b` is two branches, labelled `[tests a]` and
   `[tests b]`; an operand behind `!` reads like the source (rustc branches on the operand with swapped targets). C
-  `&&`/`||` operands are labelled the same way from the LLVM IR's columns (`[tests !ctx->no_alloc]`); operands inside
-  a macro (`GGML_ASSERT(a && b)`) carry the macro's column and stay unlabelled.
+  `&&`/`||` operands are labelled the same way from the LLVM IR's columns (`[tests !ctx->no_alloc]`); operands inside a
+  macro argument (`GGML_ASSERT(a && b)`) are labelled too: their instructions carry the spelled column (clang's
+  `getMacroDebugLoc`), the branch itself the macro body's, so the operand start skips the branch.
 - A line instead of a name picks the innermost function around it: a JS/TS anonymous callback is
-  `outer::<arrow@L>`, a Rust closure `outer::{closure#0}`.
+  `outer::<arrow@L>`, a Rust closure `outer::{closure#0}`. Two Rust closures on one line: `"LINE:COL"` picks the one whose body holds
+  that column (a bare line names both and asks for one).
 - `follow=N` appends each project callee's graph (`── calls name  path:line (at lines)`, nested with `│`), N levels,
-  at most 8 callees per function, each function once.
+  each function once, at most `follow_limit` per function; the rest are named in a `── … N more callees` line.
 - JS/TS need `node`, `acorn` and `@sveltejs/acorn-typescript` (`npm ci` in `src/codeflow` after a fresh clone); C needs `uv` (tree-sitter grammars are pinned in
   `ccfg.py`'s script header); Rust needs the `rustc-master` toolchain (the driver rebuilds itself when it changes).

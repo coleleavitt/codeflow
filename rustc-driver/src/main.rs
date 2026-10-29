@@ -33,7 +33,14 @@ fn main() {
     let probe = args.windows(2).any(|w| w[0] == "--cfg" && w[1].starts_with("codeflow_probe"));
     let query = match (std::env::var("CODEFLOW_FN"), std::env::var("CODEFLOW_LINE")) {
         (Ok(name), _) => Some(Query::Name(name)),
-        (_, Ok(line)) => Some(Query::Line(line.parse().expect("CODEFLOW_LINE is not a line number"))),
+        (_, Ok(at)) => Some(match at.split_once(':') {
+            // `LINE:COL` picks between closures on one line: the innermost body containing that point.
+            Some((line, col)) => Query::Line(
+                line.parse().expect("CODEFLOW_LINE is not LINE or LINE:COL"),
+                Some(col.parse().expect("CODEFLOW_LINE is not LINE or LINE:COL")),
+            ),
+            None => Query::Line(at.parse().expect("CODEFLOW_LINE is not LINE or LINE:COL"), None),
+        }),
         _ => None,
     };
     let Some(query) = query.filter(|_| probe) else {
@@ -90,7 +97,7 @@ fn matches(item: &CrateItem, query: &str) -> bool {
 
 enum Query {
     Name(String),
-    Line(usize),
+    Line(usize, Option<usize>),
 }
 
 fn is_async_fn(item: &CrateItem) -> bool {
@@ -118,7 +125,7 @@ fn by_name(items: &[CrateItem], query: &str, file: Option<&Path>) -> Result<Crat
 
 /// The innermost function, closure or async block in `file` whose body span contains `line`.
 /// The coroutine of an `async fn` stands for the fn itself.
-fn by_line(items: &[CrateItem], line: usize, file: &Path) -> Result<CrateItem, String> {
+fn by_line(items: &[CrateItem], line: usize, col: Option<usize>, file: &Path) -> Result<CrateItem, String> {
     let spans: Vec<(CrateItem, [usize; 4])> = items
         .iter()
         .filter(|item| {
@@ -128,7 +135,11 @@ fn by_line(items: &[CrateItem], line: usize, file: &Path) -> Result<CrateItem, S
         .filter_map(|item| {
             let span = item.expect_body().span;
             let l = span.get_lines();
-            (l.start_line <= line && line <= l.end_line && span_file(&span) == file)
+            let inside = match col {
+                Some(col) => (l.start_line, l.start_col) <= (line, col) && (line, col) <= (l.end_line, l.end_col),
+                None => l.start_line <= line && line <= l.end_line,
+            };
+            (inside && span_file(&span) == file)
                 .then_some((*item, [l.start_line, l.start_col, l.end_line, l.end_col]))
         })
         .collect();
@@ -149,7 +160,7 @@ fn by_line(items: &[CrateItem], line: usize, file: &Path) -> Result<CrateItem, S
         [] => Err(format!("no local function or closure contains line {line} of {}", file.display())),
         many => {
             let names: Vec<String> = many.iter().map(|item| item.name()).collect();
-            Err(format!("line {line} is in several closures, select one by name: {}", names.join(", ")))
+            Err(format!("line {line} is in several closures, select one by name or with LINE:COL: {}", names.join(", ")))
         }
     }
 }
@@ -161,7 +172,7 @@ fn dump(query: &Query, file: Option<&Path>) -> Result<Value, String> {
         .collect();
     let item = match query {
         Query::Name(name) => by_name(&items, name, file)?,
-        Query::Line(line) => by_line(&items, *line, file.ok_or("CODEFLOW_LINE needs CODEFLOW_FILE")?)?,
+        Query::Line(line, col) => by_line(&items, *line, *col, file.ok_or("CODEFLOW_LINE needs CODEFLOW_FILE")?)?,
     };
     // An `async fn` only builds its coroutine; the code lives in the coroutine's body.
     let body_item = if is_async_fn(&item) {

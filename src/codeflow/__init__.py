@@ -113,12 +113,13 @@ class FlowGraph:
 
 async def cfg(
     path: str | os.PathLike[str],
-    function: str | int,
+    function: str | int,  # a name, a 1-based line, or "LINE:COL" (Rust: between closures on one line)
     *,
     level: str = "source",
     cleanup: bool = False,
     root: str | os.PathLike[str] | None = None,
     follow: int = 0,
+    follow_limit: int = 20,
 ) -> FlowGraph:
     """The control-flow graph of ``function`` in ``path``: its blocks with their source lines, what ends
     each (a branch condition, a loop, a call, a return, a raise), and the edges between them.
@@ -131,8 +132,8 @@ async def cfg(
     state machine (state dispatch, resume edges, each ``.await``'s Ready/Pending with the suspend);
     ``"mir"`` is the compiler's graph untouched. ``cleanup=True`` adds the unwind/cleanup paths.
     ``follow=N`` also shows the graph of each project function it calls, ``N`` levels deep (callees
-    from the language server's call hierarchy, or acorn's for JavaScript bundles; at most
-    ``_MAX_FOLLOWED`` per function, each shown once).
+    from the language server's call hierarchy, or acorn's for JavaScript bundles; each shown once;
+    at most ``follow_limit`` per function, the rest counted in a "… N more callees" line).
     """
     if level not in ("source", "async", "mir"):
         raise ValueError("level must be 'source', 'async' or 'mir'")
@@ -142,6 +143,8 @@ async def cfg(
     file = Path(path).expanduser().resolve()
     if not file.is_file():
         raise FileNotFoundError(file)
+    if isinstance(function, str) and re.fullmatch(r"\d+:\d+", function) and file.suffix != ".rs":
+        function = int(function.split(":")[0])  # only Rust tells closures on one line apart by column
     if file.suffix == ".py":
         if isinstance(function, int):
             function = _cfg.name_at(file, function)
@@ -193,17 +196,18 @@ async def cfg(
     base = _root(file, root)
     result = FlowGraph(str(graph["function"]), _cfg.render(simple, base), simple)
     if follow > 0:
-        await _follow(result, file, graph, base, level, cleanup, follow, {(str(file), graph["line"])})
+        await _follow(result, file, graph, base, level, cleanup, follow, {(str(file), graph["line"])}, follow_limit)
     return result
 
 
-_MAX_FOLLOWED = 8
-
-
-async def _follow(result: FlowGraph, file: Path, graph: dict, base: Path, level: str, cleanup: bool, depth: int, shown: set) -> None:
-    """Append the graphs of the project functions ``graph``'s function calls, ``depth`` levels deep."""
+async def _follow(
+    result: FlowGraph, file: Path, graph: dict, base: Path, level: str, cleanup: bool, depth: int, shown: set, limit: int
+) -> None:
+    """Append the graphs of the project functions ``graph``'s function calls, ``depth`` levels deep,
+    at most ``limit`` per function."""
     sections = []
-    for name, path, line, sites in (await _direct_callees(file, graph, base))[:_MAX_FOLLOWED]:
+    callees = [c for c in await _direct_callees(file, graph, base) if (str(c[1]), c[2]) not in shown]
+    for name, path, line, sites in callees[:limit]:
         if (str(path), line) in shown:
             continue
         shown.add((str(path), line))
@@ -215,9 +219,12 @@ async def _follow(result: FlowGraph, file: Path, graph: dict, base: Path, level:
             sections.append(f"── calls {name}  {_rel(str(path), base)}:{line}  (at {sites}): no graph ({str(error).splitlines()[0][:100]})")
             continue
         if depth > 1:
-            await _follow(child, Path(path), child.graph, base, level, cleanup, depth - 1, shown)
+            await _follow(child, Path(path), child.graph, base, level, cleanup, depth - 1, shown, limit)
         nested = "\n".join("│   " + text for text in child.text.splitlines())
         sections.append(f"── calls {name}  {_rel(str(path), base)}:{line}  (at {sites})\n{nested}")
+    if len(callees) > limit:
+        rest = ", ".join(name for name, *_ in callees[limit:limit + 12])
+        sections.append(f"── … {len(callees) - limit} more callees (follow_limit={limit}): {rest}{' …' if len(callees) - limit > 12 else ''}")
     if sections:
         result.text += "\n\n" + "\n\n".join(sections)
 
@@ -293,16 +300,26 @@ def _returns_normally(graph: dict) -> bool:
     return any(e["to"] in exits and e["label"] in _NORMAL_EXIT for b in simple["blocks"] for e in b["succ"])
 
 
-async def _inferred_never(file: Path, calls: list[tuple[int, int, str]], known: set[tuple[int, int]]) -> set[tuple[int, int]]:
-    """Call statements whose callee, though untyped, never returns: its own graph (one level, no
-    further inference) has no normal return. The definition comes from the language server, else
-    from a same-named function in the file."""
+_INFER_DEPTH = 3
+
+
+async def _inferred_never(
+    file: Path,
+    calls: list[tuple[int, int, str]],
+    known: set[tuple[int, int]],
+    depth: int = _INFER_DEPTH,
+    memo: dict[tuple[str, int], bool | None] | None = None,
+) -> set[tuple[int, int]]:
+    """Call statements whose callee, though untyped, never returns: its own graph has no normal
+    return, with its own calls judged the same way ``depth`` levels down. The definition comes from
+    the language server, else from a same-named function in the file. ``memo`` caches each
+    definition; one still being judged (recursion) counts as returning."""
     from rlm import lsp
 
-    from . import _cfg
-
+    memo = {} if memo is None else memo
     found: set[tuple[int, int]] = set()
-    cache: dict[tuple[str, int], bool] = {}
+    if depth <= 0:
+        return found
     for line, col, name in calls[:_MAX_HOVERS]:
         if (line, col) in known:
             continue
@@ -318,12 +335,13 @@ async def _inferred_never(file: Path, calls: list[tuple[int, int, str]], known: 
         if target is None or target[0].suffix not in {".py", *_JS, *_TS} or not target[0].is_file():
             continue
         key = (str(target[0]), target[1])
-        if key not in cache:
+        if key not in memo:
+            memo[key] = None  # being judged: a recursive call counts as returning
             try:
-                cache[key] = not _returns_normally(await _plain_graph(*target))
+                memo[key] = not _returns_normally(await _plain_graph(*target, depth - 1, memo))
             except (LookupError, RuntimeError, SyntaxError, ValueError):
-                cache[key] = False
-        if cache[key]:
+                memo[key] = False
+        if memo[key]:
             found.add((line, col))
     return found
 
@@ -336,8 +354,9 @@ def _same_file_definition(file: Path, name: str) -> tuple[Path, int] | None:
     return None
 
 
-async def _plain_graph(file: Path, line: int) -> dict:
-    """A function's graph by line with only the known never-returning names (no inference)."""
+async def _plain_graph(file: Path, line: int, depth: int, memo: dict) -> dict:
+    """A function's graph by line, its calls judged ``depth`` levels down (known names, same-file
+    annotations, callee graphs; no hover)."""
     from . import _cfg
 
     if file.suffix == ".py":
@@ -345,8 +364,13 @@ async def _plain_graph(file: Path, line: int) -> dict:
         calls = _cfg.statement_calls(file, name)
         local = _cfg.local_noreturn(file)
         never = {(l, c) for l, c, n in calls if n in _cfg._KNOWN_NORETURN or n.split(".")[-1] in local}
+        never |= await _inferred_never(file, calls, never, depth, memo)
         return await asyncio.to_thread(_cfg.py_cfg, file, name, never)
-    return await asyncio.to_thread(_run_json, ["node", str(_HERE / "jscfg.mjs"), str(file), str(line), "[]"])
+    walker = ["node", str(_HERE / "jscfg.mjs"), str(file), str(line)]
+    calls = [tuple(x) for x in await asyncio.to_thread(_run_json, [*walker, "--calls"])]
+    never = {(l, c) for l, c, n in calls if n in ("process.exit", "process.abort")}
+    never |= await _inferred_never(file, calls, never, depth, memo)
+    return await asyncio.to_thread(_run_json, [*walker, json.dumps(sorted(never))])
 
 
 def _run_json(command: list[str]) -> dict:

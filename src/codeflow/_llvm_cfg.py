@@ -129,9 +129,11 @@ def llvm_cfg(file: Path, function: str) -> dict | None:
             succ = [{"to": ids[then], "label": "true"}, {"to": ids[other], "label": "false"}]
             # Where this branch's operand starts: the leftmost instruction on the branch's line
             # (the block holds only that operand's loads and compare).
+            # Not the branch itself: in a macro it carries the macro body's column, while the operand's
+            # loads and compares carry the argument's spelled column (clang's getMacroDebugLoc).
             columns = [
                 locations[m.group(1)][1]
-                for instr in text[label]
+                for instr in text[label][:-1]
                 if (m := _DBG.search(instr)) and m.group(1) in locations and at and locations[m.group(1)][0] == at[0]
             ]
             test = (at[0], min(columns)) if columns else at

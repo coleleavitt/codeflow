@@ -42,6 +42,18 @@ def fn_name(node):
     return text(name, 200) if name is not None else None
 
 
+if wanted.isdigit():  # a line: the function around it
+    line = int(wanted)
+    around = [n for n in walk(tree.root_node) if n.type == "function_definition" and n.start_point[0] + 1 <= line <= n.end_point[0] + 1]
+    if not around:
+        print(f"no function around {path}:{line}", file=sys.stderr)
+        sys.exit(3)
+    inner = min(around, key=lambda n: n.end_byte - n.start_byte)
+    if "--name" in sys.argv:
+        print(fn_name(inner))
+        sys.exit(0)
+    wanted = fn_name(inner)
+
 target = next(
     (n for n in walk(tree.root_node) if n.type == "function_definition" and (fn_name(n) or "").split("::")[-1] in (wanted, wanted.split("::")[-1]) and (fn_name(n) == wanted or "::" not in wanted or fn_name(n).endswith(wanted))),
     None,

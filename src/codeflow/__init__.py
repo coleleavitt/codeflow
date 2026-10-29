@@ -58,22 +58,43 @@ async def tree(
     depth: int = 3,
     root: str | os.PathLike[str] | None = None,
     external: bool = False,
+    backend: str | None = None,
 ) -> FlowTree:
     """The call tree of the function at ``at`` in ``path``.
 
     ``direction``: ``"outgoing"`` (what it calls) or ``"incoming"`` (who calls
     it). ``depth`` bounds the levels. LSP trees expand only functions under
     ``root`` (default: the file's git root); with ``external=True`` calls into
-    dependencies and the standard library are listed too (never expanded).
+    dependencies and the standard library are listed too (never expanded). JavaScript in a project
+    (a ``package.json``/``tsconfig.json``/``jsconfig.json`` above it, not bundle-sized) goes through
+    the TypeScript server, which resolves ``obj.method()`` by type; bundles and loose files through
+    acorn. ``backend="lsp"`` or ``"acorn"`` forces one.
     """
     if direction not in ("outgoing", "incoming"):
         raise ValueError("direction must be 'outgoing' or 'incoming'")
     file = Path(path).expanduser().resolve()
     if not file.is_file():
         raise FileNotFoundError(file)
-    if file.suffix in _JS:
+    if file.suffix in _JS and (backend == "acorn" or (backend is None and not _js_project(file))):
         return await asyncio.to_thread(_js_tree, file, at, direction, depth)
-    return await _lsp_tree(file, at, direction, depth, _root(file, root), external)
+    try:
+        return await _lsp_tree(file, at, direction, depth, _root(file, root), external)
+    except (RuntimeError, LookupError):
+        if file.suffix not in _JS or backend == "lsp":
+            raise
+        return await asyncio.to_thread(_js_tree, file, at, direction, depth)
+
+
+_BUNDLE_BYTES = 400_000
+
+
+def _js_project(file: Path) -> bool:
+    """A JavaScript file of a project the TypeScript server can type, not a bundle or a loose file."""
+    if file.stat().st_size > _BUNDLE_BYTES or "node_modules" in file.parts:
+        return False
+    top = _root(file, None)  # the git root: a package.json in $HOME makes nothing a project
+    directories = [d for d in file.parents if d.is_relative_to(top)]
+    return any((d / marker).is_file() for d in directories for marker in ("package.json", "tsconfig.json", "jsconfig.json"))
 
 
 @dataclass
@@ -92,11 +113,12 @@ class FlowGraph:
 
 async def cfg(
     path: str | os.PathLike[str],
-    function: str,
+    function: str | int,
     *,
     level: str = "source",
     cleanup: bool = False,
     root: str | os.PathLike[str] | None = None,
+    follow: int = 0,
 ) -> FlowGraph:
     """The control-flow graph of ``function`` in ``path``: its blocks with their source lines, what ends
     each (a branch condition, a loop, a call, a return, a raise), and the edges between them.
@@ -108,30 +130,48 @@ async def cfg(
     one step, macro internals and drops hidden, straight-line calls merged); ``"async"`` adds the async
     state machine (state dispatch, resume edges, each ``.await``'s Ready/Pending with the suspend);
     ``"mir"`` is the compiler's graph untouched. ``cleanup=True`` adds the unwind/cleanup paths.
+    ``follow=N`` also shows the graph of each project function it calls, ``N`` levels deep (callees
+    from the language server's call hierarchy, or acorn's for JavaScript bundles; at most
+    ``_MAX_FOLLOWED`` per function, each shown once).
     """
     if level not in ("source", "async", "mir"):
         raise ValueError("level must be 'source', 'async' or 'mir'")
+    # ``function`` may be a 1-based line: the innermost function (or JS callback, Rust closure) around it.
     from . import _cfg
 
     file = Path(path).expanduser().resolve()
     if not file.is_file():
         raise FileNotFoundError(file)
     if file.suffix == ".py":
+        if isinstance(function, int):
+            function = _cfg.name_at(file, function)
         calls = _cfg.statement_calls(file, function)
         local = _cfg.local_noreturn(file)
         fallback = {(l, c) for l, c, name in calls if name in _cfg._KNOWN_NORETURN or name.split(".")[-1] in local}
         checked = await _never_returning(file, [(l, c) for l, c, _ in calls], _PY_NEVER)
-        graph = await asyncio.to_thread(_cfg.py_cfg, file, function, fallback if checked is None else checked | fallback)
-        graph["source"] = "ast" + ("" if checked is None else " + pyright types")
+        never = fallback | (checked or set())
+        inferred = await _inferred_never(file, calls, never)
+        graph = await asyncio.to_thread(_cfg.py_cfg, file, function, never | inferred)
+        graph["source"] = "ast" + ("" if checked is None else " + pyright types") + (" + callee graphs" if inferred else "")
     elif file.suffix in _JS | _TS:
-        walker = ["node", str(_HERE / "jscfg.mjs"), str(file), function]
+        walker = ["node", str(_HERE / "jscfg.mjs"), str(file), str(function)]
         calls = await asyncio.to_thread(_run_json, [*walker, "--calls"])
         checked = await _never_returning(file, [(l, c) for l, c, _ in calls], _TS_NEVER)
-        graph = await asyncio.to_thread(_run_json, [*walker, json.dumps(sorted(checked or []))])
-        graph["source"] = "acorn" + ("" if checked is None else " + tsgo types")
+        never = set(checked or set()) | {(l, c) for l, c, name in calls if name in ("process.exit", "process.abort")}
+        inferred = await _inferred_never(file, [tuple(x) for x in calls], never)
+        graph = await asyncio.to_thread(_run_json, [*walker, json.dumps(sorted(never | inferred))])
+        graph["source"] = "acorn" + ("" if checked is None else " + tsgo types") + (" + callee graphs" if inferred else "")
     elif file.suffix in _C:
         from ._llvm_cfg import llvm_cfg
 
+        if isinstance(function, int):
+            name_run = await asyncio.to_thread(
+                subprocess.run, ["uv", "run", "--quiet", "--script", str(_HERE / "ccfg.py"), str(file), str(function), "--name"],
+                capture_output=True, text=True, timeout=600,
+            )
+            if name_run.returncode != 0:
+                raise LookupError(name_run.stderr.strip())
+            function = name_run.stdout.strip().split("::")[-1] if "::" not in name_run.stdout else name_run.stdout.strip()
         try:
             graph = await asyncio.to_thread(llvm_cfg, file, function)
             reason = "no compile_commands.json" if graph is None else ""
@@ -150,7 +190,70 @@ async def cfg(
     else:
         raise ValueError(f"no control-flow backend for {file.suffix} files")
     simple = _cfg.simplify(graph, cleanup=cleanup)
-    return FlowGraph(str(graph["function"]), _cfg.render(simple, _root(file, root)), simple)
+    base = _root(file, root)
+    result = FlowGraph(str(graph["function"]), _cfg.render(simple, base), simple)
+    if follow > 0:
+        await _follow(result, file, graph, base, level, cleanup, follow, {(str(file), graph["line"])})
+    return result
+
+
+_MAX_FOLLOWED = 8
+
+
+async def _follow(result: FlowGraph, file: Path, graph: dict, base: Path, level: str, cleanup: bool, depth: int, shown: set) -> None:
+    """Append the graphs of the project functions ``graph``'s function calls, ``depth`` levels deep."""
+    sections = []
+    for name, path, line, sites in (await _direct_callees(file, graph, base))[:_MAX_FOLLOWED]:
+        if (str(path), line) in shown:
+            continue
+        shown.add((str(path), line))
+        # A server's item range starts at the docs and attributes: the signature line is in the function.
+        named = _name_position(Path(path), name, near=line)
+        try:
+            child = await cfg(path, named[0] if named else line, level=level, cleanup=cleanup, root=base)
+        except (LookupError, RuntimeError, ValueError, FileNotFoundError) as error:
+            sections.append(f"── calls {name}  {_rel(str(path), base)}:{line}  (at {sites}): no graph ({str(error).splitlines()[0][:100]})")
+            continue
+        if depth > 1:
+            await _follow(child, Path(path), child.graph, base, level, cleanup, depth - 1, shown)
+        nested = "\n".join("│   " + text for text in child.text.splitlines())
+        sections.append(f"── calls {name}  {_rel(str(path), base)}:{line}  (at {sites})\n{nested}")
+    if sections:
+        result.text += "\n\n" + "\n\n".join(sections)
+
+
+async def _direct_callees(file: Path, graph: dict, base: Path) -> list[tuple[str, Path, int, str]]:
+    """The project functions ``graph``'s function calls: (name, file, definition line, call lines)."""
+    short = str(graph["function"]).split("::")[-1].split(".")[-1].split("<")[0]
+    if file.suffix in _JS and not _js_project(file):
+        walked = await asyncio.to_thread(_js_graph, file)
+        owner = str(graph["function"])
+        return [
+            (callee.lstrip("&"), file, walked["nodes"][callee.lstrip("&")], str(at))
+            for callee, at in dict(walked["edges"].get(owner, [])).items()
+            if callee.lstrip("&") in walked["nodes"] and callee.lstrip("&") != owner
+        ]
+    from rlm import lsp
+
+    position = _name_position(file, short, near=max(1, int(graph["line"]) - 10))
+    if position is None:
+        return []
+    deadline = asyncio.get_running_loop().time() + _INDEX_WAIT_SECONDS
+    while True:  # a fresh server has no call hierarchy until it has indexed the workspace
+        answer = await lsp.call_hierarchy(str(file), position[0], position[1], "outgoing")
+        if answer.items or "No call hierarchy item" not in answer.text or asyncio.get_running_loop().time() > deadline:
+            break
+        await asyncio.sleep(3)
+    callees = []
+    for call in answer.items:
+        if str(call.get("kind", "")).lower() not in ("function", "method", "constructor", ""):
+            continue  # a class or struct "called" to construct it has no graph of its own
+        target = Path(call["path"]).resolve()
+        if not target.is_relative_to(base) or _VENDORED & set(target.relative_to(base).parts[:-1]):
+            continue
+        sites = ", ".join(str(n) for n in sorted({s["line"] for s in call.get("ranges", [])})[:3])
+        callees.append((call["name"], target, int(call["line"]), sites or "?"))
+    return callees
 
 
 _PY_NEVER = re.compile(r"->\s*(?:NoReturn|Never)\b")
@@ -164,6 +267,7 @@ async def _never_returning(file: Path, positions: list[tuple[int, int]], never: 
     from rlm import lsp
 
     found: set[tuple[int, int]] = set()
+    answered = False
     for line, col in positions[:_MAX_HOVERS]:
         try:
             answer = await lsp.hover(str(file), line, col)
@@ -171,9 +275,78 @@ async def _never_returning(file: Path, positions: list[tuple[int, int]], never: 
             return None
         if not answer.available:
             return None
+        answered = True
         if never.search(answer.text):
             found.add((line, col))
+    return found if answered else None
+
+
+_NORMAL_EXIT = {"return", "fall off", "then return"}
+
+
+def _returns_normally(graph: dict) -> bool:
+    """Whether some path through the graph reaches its exit by returning (not raising or exiting)."""
+    from . import _cfg
+
+    simple = _cfg.simplify(graph)
+    exits = {b["id"] for b in simple["blocks"] if b["kind"] == "exit"}
+    return any(e["to"] in exits and e["label"] in _NORMAL_EXIT for b in simple["blocks"] for e in b["succ"])
+
+
+async def _inferred_never(file: Path, calls: list[tuple[int, int, str]], known: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    """Call statements whose callee, though untyped, never returns: its own graph (one level, no
+    further inference) has no normal return. The definition comes from the language server, else
+    from a same-named function in the file."""
+    from rlm import lsp
+
+    from . import _cfg
+
+    found: set[tuple[int, int]] = set()
+    cache: dict[tuple[str, int], bool] = {}
+    for line, col, name in calls[:_MAX_HOVERS]:
+        if (line, col) in known:
+            continue
+        target: tuple[Path, int] | None = None
+        try:
+            answer = await lsp.definition(str(file), line, col)
+            if answer.available and answer.items:
+                target = (Path(answer.items[0]["path"]), int(answer.items[0]["line"]))
+        except Exception:  # noqa: BLE001 - no server: the same-file lookup below
+            target = None
+        if target is None:
+            target = _same_file_definition(file, name.split(".")[-1])
+        if target is None or target[0].suffix not in {".py", *_JS, *_TS} or not target[0].is_file():
+            continue
+        key = (str(target[0]), target[1])
+        if key not in cache:
+            try:
+                cache[key] = not _returns_normally(await _plain_graph(*target))
+            except (LookupError, RuntimeError, SyntaxError, ValueError):
+                cache[key] = False
+        if cache[key]:
+            found.add((line, col))
     return found
+
+
+def _same_file_definition(file: Path, name: str) -> tuple[Path, int] | None:
+    pattern = re.compile(rf"^\s*(?:async\s+)?(?:def|function)\s+{re.escape(name)}\b|^\s*(?:const|let|var)\s+{re.escape(name)}\s*=")
+    for number, text in enumerate(file.read_text(errors="replace").splitlines(), 1):
+        if pattern.search(text):
+            return file, number
+    return None
+
+
+async def _plain_graph(file: Path, line: int) -> dict:
+    """A function's graph by line with only the known never-returning names (no inference)."""
+    from . import _cfg
+
+    if file.suffix == ".py":
+        name = _cfg.name_at(file, line)
+        calls = _cfg.statement_calls(file, name)
+        local = _cfg.local_noreturn(file)
+        never = {(l, c) for l, c, n in calls if n in _cfg._KNOWN_NORETURN or n.split(".")[-1] in local}
+        return await asyncio.to_thread(_cfg.py_cfg, file, name, never)
+    return await asyncio.to_thread(_run_json, ["node", str(_HERE / "jscfg.mjs"), str(file), str(line), "[]"])
 
 
 def _run_json(command: list[str]) -> dict:
@@ -238,7 +411,8 @@ def _name_position(file: Path, name: str, near: int | None = None) -> tuple[int,
         lines = file.read_text(errors="replace").splitlines()
     except OSError:
         return None
-    short = name.split("::")[-1].split(".")[-1]
+    # jdtls and csharp-ls name items by signature (`export(List<X>, Path) : int`): the name is its first word.
+    short = re.split(r"[(<\s:]", name.split("::")[-1].split(".")[-1] if "(" not in name else name.split("(")[0].split("::")[-1].split(".")[-1])[0]
     if near is not None:
         word = re.compile(rf"\b{re.escape(short)}\b")
         for index in range(max(near - 1, 0), min(near + 60, len(lines))):
@@ -296,7 +470,14 @@ async def _lsp_tree(file: Path, at: str | int, direction: str, depth: int, root:
         outside: list[str] = []
         result = []
         hidden = 0
-        for call in answer.items:
+        merged: dict[tuple[str, int, str], dict] = {}
+        for call in answer.items:  # jdtls answers one item per call site: one child per callee
+            key = (call["path"], call["line"], call["name"])
+            if key in merged:
+                merged[key] = dict(merged[key], ranges=merged[key].get("ranges", []) + call.get("ranges", []))
+            else:
+                merged[key] = call
+        for call in merged.values():
             resolved = Path(call["path"]).resolve()
             inside = resolved.is_relative_to(root) and not _VENDORED & set(resolved.relative_to(root).parts[:-1])
             sites = ", ".join(str(n) for n in sorted({site["line"] for site in call.get("ranges", [])})[:3])

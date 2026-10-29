@@ -127,7 +127,14 @@ def llvm_cfg(file: Path, function: str) -> dict | None:
             then, other = _TARGET.findall(terminator)
             kind, label_text = "switch", ""
             succ = [{"to": ids[then], "label": "true"}, {"to": ids[other], "label": "false"}]
-            test = at
+            # Where this branch's operand starts: the leftmost instruction on the branch's line
+            # (the block holds only that operand's loads and compare).
+            columns = [
+                locations[m.group(1)][1]
+                for instr in text[label]
+                if (m := _DBG.search(instr)) and m.group(1) in locations and at and locations[m.group(1)][0] == at[0]
+            ]
+            test = (at[0], min(columns)) if columns else at
         elif terminator.startswith("br "):
             kind, label_text = "goto", ""
             succ = [{"to": ids[_TARGET.findall(terminator)[0]], "label": ""}]

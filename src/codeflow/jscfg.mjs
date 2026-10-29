@@ -43,6 +43,27 @@ for (const n of nodes(ast)) {
     for (const m of n.body.body) if (m.key && key(m.key) === method && (m.type === "MethodDefinition" || isFn(m.value)) && m.value?.body) target = m.value;
   }
 }
+// A line instead of a name: the innermost function around it (an anonymous callback too, named
+// after its enclosing function).
+if (/^\d+$/.test(wanted)) {
+  const line = Number(wanted);
+  const named = new Map();
+  for (const n of nodes(ast)) {
+    if (n.type === "FunctionDeclaration" && n.id) named.set(n, n.id.name);
+    else if (n.type === "VariableDeclarator" && n.id.type === "Identifier" && isFn(n.init)) named.set(n.init, n.id.name);
+    else if ((n.type === "ClassDeclaration" || n.type === "ClassExpression") && n.id)
+      for (const m of n.body.body) if (m.key && isFn(m.value)) named.set(m.value, `${n.id.name}.${key(m.key)}`);
+  }
+  let best = null, outer = null;
+  for (const n of nodes(ast)) {
+    if (!isFn(n) || !n.body || n.loc.start.line > line || n.loc.end.line < line) continue;
+    if (!best || n.start >= best.start) { if (named.has(n)) outer = named.get(n); best = n; }
+  }
+  if (best) {
+    target = best;
+    targetName = named.get(best) ?? `${outer ?? "<top>"}::<${best.type === "ArrowFunctionExpression" ? "arrow" : "function"}@${best.loc.start.line}>`;
+  }
+}
 if (!target) { console.error(`no function ${wanted} in ${file}`); process.exit(3); }
 
 const calleePos = (call) => {

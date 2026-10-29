@@ -243,6 +243,31 @@ class _Builder:
         return cur
 
 
+def name_at(file: Path, line: int) -> str:
+    """The innermost function around ``line``, as ``Class.method`` or ``function``."""
+    tree = ast.parse(file.read_text(errors="replace"))
+    best: tuple[int, str] | None = None
+
+    def visit(node: ast.AST, owner: str | None) -> None:
+        nonlocal best
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, child.name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child.lineno <= line <= child.end_lineno:
+                    span = child.end_lineno - child.lineno
+                    if best is None or span <= best[0]:
+                        best = (span, f"{owner}.{child.name}" if owner else child.name)
+                visit(child, None)
+            else:
+                visit(child, owner)
+
+    visit(tree, None)
+    if best is None:
+        raise LookupError(f"no function around {file}:{line}")
+    return best[1]
+
+
 def _find_def(tree: ast.AST, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
     parts = name.split(".")
     found = None
@@ -457,16 +482,19 @@ def ir_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dic
         shown = line if len(line) <= 70 else line[:69] + "…"
         b["label"] = shown if not tested or tested.strip() == condition.strip() else f"{shown}   [tests {tested}]"
     if not graph.get("negation_folded", True):
-        # LLVM IR keeps each operand's own condition; its column is not reliable enough to slice
-        # the operand, so several branches from one `&&`/`||` line are numbered in column order.
-        by_line: dict[int, list[dict]] = {}
+        # LLVM IR: each `&&`/`||` operand is its own branch, starting at the leftmost column of its
+        # block's instructions on that line; it runs to the next operator at its depth.
         for b in blocks.values():
-            if b["kind"] == "switch" and b.get("test") and len(b["succ"]) == 2:
-                by_line.setdefault(b["test"][0], []).append(b)
-        for row, parts in by_line.items():
-            if len(parts) > 1 and source and re.search(r"&&|\|\|", source[row - 1]):
-                for k, b in enumerate(sorted(parts, key=lambda b: b["test"][1]), 1):
-                    b["label"] = f"{b['label']}   [part {k} of {len(parts)}]"
+            test = b.get("test")
+            if b["kind"] != "switch" or not test or len(b["succ"]) != 2 or not source or test[0] > len(source):
+                continue
+            row = source[test[0] - 1]
+            if not re.search(r"&&|\|\|", row):
+                continue
+            operand = _operand_at(row, test[1] - 1)
+            # A macro's instructions carry the macro's column: a span holding an operator is no operand.
+            if operand and not re.search(r"&&|\|\|", operand) and operand not in b["label"][: len(operand)]:
+                b["label"] = f"{b['label']}   [tests {operand}]"
     # MIR sends every `return` through one shared block: the block that sets the value says it.
     for b in blocks.values():
         if not b["label"] and b["lines"] and source:
@@ -511,6 +539,31 @@ def ir_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dic
         if b["kind"] == "return" and not b["succ"]:
             b["succ"] = [{"to": -1, "label": "return"}]
     return dict(graph, entry=entry, blocks=kept + [exit_block])
+
+
+def _operand_at(row: str, start: int) -> str:
+    """The `&&`/`||` operand starting at ``start`` (a `!` just before it included). A start on the
+    operator itself (the right operand's branch) steps past it."""
+    while row.startswith(("&&", "||"), start) or (start < len(row) and row[start] == " "):
+        start += 2 if row.startswith(("&&", "||"), start) else 1
+    begin = start
+    while begin > 0 and row[begin - 1] in "!( " and row[begin - 1] != "(":
+        begin -= 1
+    while begin < start and row[begin] == " ":
+        begin += 1
+    depth, i = 0, start
+    while i < len(row):
+        ch = row[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and (row.startswith("&&", i) or row.startswith("||", i) or ch in "?;,"):
+            break
+        i += 1
+    return row[begin:i].strip()
 
 
 def _reachable(blocks: dict[int, dict], entry: int) -> list[int]:

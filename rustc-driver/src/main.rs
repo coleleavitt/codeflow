@@ -1,8 +1,9 @@
 //! `RUSTC_WORKSPACE_WRAPPER` that dumps one function's MIR control-flow graph as JSON.
 //!
-//! Invoked as `<driver> <rustc> <args...>`. When `CODEFLOW_FN` is set and the args carry
-//! `--cfg codeflow_probe*`, the crate is analyzed through `rustc_public`, the CFG of the matching
-//! local function is written to `CODEFLOW_OUT`, and compilation stops. Otherwise the real rustc runs.
+//! Invoked as `<driver> <rustc> <args...>`. When `CODEFLOW_FN` or `CODEFLOW_LINE` is set and the args
+//! carry `--cfg codeflow_probe*`, the crate is analyzed through `rustc_public`, the CFG of the matching
+//! local function or closure is written to `CODEFLOW_OUT`, and compilation stops. Otherwise the real
+//! rustc runs.
 #![feature(rustc_private)]
 
 extern crate rustc_driver;
@@ -30,7 +31,12 @@ use serde_json::{Value, json};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let probe = args.windows(2).any(|w| w[0] == "--cfg" && w[1].starts_with("codeflow_probe"));
-    let Some(query) = std::env::var("CODEFLOW_FN").ok().filter(|_| probe) else {
+    let query = match (std::env::var("CODEFLOW_FN"), std::env::var("CODEFLOW_LINE")) {
+        (Ok(name), _) => Some(Query::Name(name)),
+        (_, Ok(line)) => Some(Query::Line(line.parse().expect("CODEFLOW_LINE is not a line number"))),
+        _ => None,
+    };
+    let Some(query) = query.filter(|_| probe) else {
         let err = Command::new(&args[1]).args(&args[2..]).exec();
         eprintln!("codeflow: cannot run {}: {err}", args[1]);
         exit(1);
@@ -70,32 +76,95 @@ fn matches(item: &CrateItem, query: &str) -> bool {
         forms.push(format!("{}::{method}", short_path(self_ty)));
         forms.push(format!("{}::{method}", short_path(tr)));
     }
+    // Inherent methods are `m::<impl Type>::method` (in trait impls `m::<impl Tr for Type>::method`):
+    // `Type::method` names them as written.
+    if let Some(start) = name.find("<impl ")
+        && let Some(end) = name[start..].find(">::")
+    {
+        let inner = &name[start + "<impl ".len()..start + end];
+        let self_ty = inner.rsplit_once(" for ").map_or(inner, |(_, ty)| ty);
+        forms.push(format!("{}::{}", short_path(self_ty), &name[start + end + 3..]));
+    }
     forms.iter().any(|f| f == query || f.ends_with(&format!("::{query}")))
 }
 
-fn dump(query: &str, file: Option<&Path>) -> Result<Value, String> {
-    let items = rustc_public::all_local_items();
-    let mut found: Vec<CrateItem> = items
-        .iter()
-        .filter(|item| item.kind() == ItemKind::Fn && item.has_body() && matches(item, query))
-        .copied()
-        .collect();
+enum Query {
+    Name(String),
+    Line(usize),
+}
+
+fn is_async_fn(item: &CrateItem) -> bool {
+    item.ty().kind().fn_def().is_some_and(|(def, _)| def.asyncness().is_async())
+}
+
+/// The function or closure named `query` (full path or path suffix, e.g. `outer::{closure#0}`),
+/// preferring those defined in `file`.
+fn by_name(items: &[CrateItem], query: &str, file: Option<&Path>) -> Result<CrateItem, String> {
+    let mut found: Vec<CrateItem> = items.iter().filter(|item| matches(item, query)).copied().collect();
     if let Some(file) = file
         && found.iter().any(|item| span_file(&item.span()) == file)
     {
         found.retain(|item| span_file(&item.span()) == file);
     }
-    let item = match found.as_slice() {
-        [item] => *item,
-        [] => return Err(format!("no local function matches `{query}`")),
+    match found.as_slice() {
+        [item] => Ok(*item),
+        [] => Err(format!("no local function matches `{query}`")),
         many => {
             let names: Vec<String> = many.iter().map(|item| item.name()).collect();
-            return Err(format!("`{query}` is ambiguous: {}", names.join(", ")));
+            Err(format!("`{query}` is ambiguous: {}", names.join(", ")))
         }
+    }
+}
+
+/// The innermost function, closure or async block in `file` whose body span contains `line`.
+/// The coroutine of an `async fn` stands for the fn itself.
+fn by_line(items: &[CrateItem], line: usize, file: &Path) -> Result<CrateItem, String> {
+    let spans: Vec<(CrateItem, [usize; 4])> = items
+        .iter()
+        .filter(|item| {
+            let def = item.span();
+            def.get_lines().start_line <= line && span_file(&def) == file
+        })
+        .filter_map(|item| {
+            let span = item.expect_body().span;
+            let l = span.get_lines();
+            (l.start_line <= line && line <= l.end_line && span_file(&span) == file)
+                .then_some((*item, [l.start_line, l.start_col, l.end_line, l.end_col]))
+        })
+        .collect();
+    let contains = |a: &[usize; 4], b: &[usize; 4]| (a[0], a[1]) <= (b[0], b[1]) && (b[2], b[3]) <= (a[2], a[3]);
+    let innermost: Vec<CrateItem> = spans
+        .iter()
+        .filter(|(item, a)| !spans.iter().any(|(other, b)| other != item && contains(a, b)))
+        .map(|(item, _)| *item)
+        .collect();
+    let lift = |item: CrateItem| match item.def_id().parent() {
+        Some(parent) if item.ty().kind().is_coroutine() => {
+            items.iter().find(|fun| fun.def_id() == parent && is_async_fn(fun)).copied().unwrap_or(item)
+        }
+        _ => item,
+    };
+    match innermost.as_slice() {
+        [item] => Ok(lift(*item)),
+        [] => Err(format!("no local function or closure contains line {line} of {}", file.display())),
+        many => {
+            let names: Vec<String> = many.iter().map(|item| item.name()).collect();
+            Err(format!("line {line} is in several closures, select one by name: {}", names.join(", ")))
+        }
+    }
+}
+
+fn dump(query: &Query, file: Option<&Path>) -> Result<Value, String> {
+    let items: Vec<CrateItem> = rustc_public::all_local_items()
+        .into_iter()
+        .filter(|item| item.kind() == ItemKind::Fn && item.has_body())
+        .collect();
+    let item = match query {
+        Query::Name(name) => by_name(&items, name, file)?,
+        Query::Line(line) => by_line(&items, *line, file.ok_or("CODEFLOW_LINE needs CODEFLOW_FILE")?)?,
     };
     // An `async fn` only builds its coroutine; the code lives in the coroutine's body.
-    let is_async = item.ty().kind().fn_def().is_some_and(|(def, _)| def.asyncness().is_async());
-    let body_item = if is_async {
+    let body_item = if is_async_fn(&item) {
         items
             .iter()
             .find(|c| c.def_id().parent() == Some(item.def_id()) && c.ty().kind().is_coroutine())

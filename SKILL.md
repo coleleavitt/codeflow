@@ -10,9 +10,11 @@ print(await codeflow.tree("crates/pa-tui/src/session_ui/queue.rs", "send_now")) 
 print(await codeflow.tree("src/server.py", "handle", direction="incoming", depth=2))      # who calls it
 print(await codeflow.tree("chunk.deob.js", "$9t.sendQueuedNow", depth=4))                 # a JS bundle
 print(await codeflow.cfg("src/rlm/repl.py", "_run_guarded"))                              # every path through one function
+print(await codeflow.cfg("ggml/src/ggml.c", 1778))                                        # the function around a line
+print(await codeflow.cfg("src/server.py", "handle", follow=1))                            # plus each project callee's graph
 ```
 
-`cfg(path, function, *, level="source", cleanup=False)` (.py, .js/.mjs/.cjs, .ts/.tsx/.mts/.cts, .c/.h/.cc/.cpp, .rs)
+`cfg(path, function_or_line, *, level="source", cleanup=False, follow=0)` (.py, .js/.mjs/.cjs, .ts/.tsx/.mts/.cts, .c/.h/.cc/.cpp, .rs)
 prints one line per block: `B3  :1081  if <condition>` with its edges
 (`true → B4`, `loop`, `done`, `exception`, `return`, `then re-raise`, `case X`, `goto L`; `↺` a loop back-edge,
 `← B1, B2` where paths join). Python `finally`, JS `finally`, C `goto`/`switch` fall-through and C++ `try` are
@@ -26,6 +28,9 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
 - `direction`: `"outgoing"` (default) or `"incoming"`. `depth`: levels (default 3).
 - LSP trees expand only functions under `root` (default: the file's git root); `external=True` lists calls into
   dependencies and std as one leaf line.
+- JavaScript in a project (a `package.json`/`tsconfig.json`/`jsconfig.json` up to its git root, under 400 KB) goes
+  through the TypeScript server, which resolves `obj.method()` by type; bundles and loose files through acorn;
+  `backend="lsp"|"acorn"` forces one (an LSP failure falls back to acorn).
 - The result prints as a tree (`name  path:line  (at <call lines>)`, `↺` a cycle, `(expanded above)` a repeat);
   `.edges` is `[(caller, callee, "path:line"), ...]`.
 
@@ -47,8 +52,10 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
 - Syntax and server facts only: dynamic dispatch, callbacks stored in data, and macros may be missing; say so when
   a conclusion depends on them. The JS walker resolves top-level functions and `this.` methods of the same class;
   `obj.method()` on other objects is left out.
-- LSP trees need the language's server in `lspServers` (`await rlm.lsp.servers()`: rust-analyzer, pyright, clangd,
-  typescript-language-server); a first call on a big Rust workspace waits for rust-analyzer to index. clangd needs a
+- LSP trees need the language's server in `lspServers` (`await rlm.lsp.servers()`). Call trees: Rust
+  (rust-analyzer), Python (pyright), C/C++ (clangd), TypeScript/JavaScript (TS 7 `tsc --lsp`), Go (gopls), Dart,
+  Java (jdtls), C# (csharp-ls), Swift (sourcekit-lsp). Lua, Zig, PHP and Bash servers answer `rlm.lsp` definitions,
+  references and hover but have no call hierarchy; a first call on a big Rust workspace waits for rust-analyzer to index. clangd needs a
   `compile_commands.json` (project root or `build/`) to resolve calls across files.
 - Each graph's header names its backend. C/C++ graphs come from LLVM IR (clang `-O0 -g` with the file's
   `compile_commands.json` flags): macros are expanded, a `noreturn` call ends its path, and C++ exceptions are real
@@ -56,10 +63,16 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
   shown with `cleanup=True`) (`GGML_ASSERT` is a branch
   whose failing side "never returns"); without a compile command it falls back to tree-sitter and says why. Python and
   JS ask the type checker which call statements never return (pyright `NoReturn`/`Never`, tsgo `never`), falling
-  back to known names (`sys.exit`, `os._exit`, `process.exit`) and same-file `NoReturn` annotations; TypeScript does
-  not infer `never` for a function declaration that only throws.
+  back to known names (`sys.exit`, `os._exit`, `process.exit`) and same-file `NoReturn` annotations. Untyped helpers
+  too: a called function whose own graph has no normal return (it always raises, throws or exits) ends its caller's
+  path ("+ callee graphs" in the header; one level deep, definitions from the language server or the same file).
 - Rust branch labels: each MIR branch tests one operand, so `a || b` is two branches, labelled `[tests a]` and
   `[tests b]`; an operand behind `!` reads like the source (rustc branches on the operand with swapped targets). C
-  branches from one `&&`/`||` line are numbered `[part k of n]`.
+  `&&`/`||` operands are labelled the same way from the LLVM IR's columns (`[tests !ctx->no_alloc]`); operands inside
+  a macro (`GGML_ASSERT(a && b)`) carry the macro's column and stay unlabelled.
+- A line instead of a name picks the innermost function around it: a JS/TS anonymous callback is
+  `outer::<arrow@L>`, a Rust closure `outer::{closure#0}`.
+- `follow=N` appends each project callee's graph (`── calls name  path:line (at lines)`, nested with `│`), N levels,
+  at most 8 callees per function, each function once.
 - JS/TS need `node`, `acorn` and `@sveltejs/acorn-typescript` (`npm ci` in `src/codeflow` after a fresh clone); C needs `uv` (tree-sitter grammars are pinned in
   `ccfg.py`'s script header); Rust needs the `rustc-master` toolchain (the driver rebuilds itself when it changes).

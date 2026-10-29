@@ -50,8 +50,9 @@ def _target(file: pathlib.Path, package_dir: pathlib.Path, package: str) -> list
     return ["--lib"]
 
 
-def rust_cfg(file: pathlib.Path, function: str) -> dict:
-    """The MIR control-flow graph of `function` (a name or path suffix) defined in `file`."""
+def rust_cfg(file: pathlib.Path, function: str | int) -> dict:
+    """The MIR control-flow graph of `function` defined in `file`: a name or path suffix (closures as
+    `outer::{closure#0}`), or a 1-based line, which picks the innermost fn, closure or async block around it."""
     file = file.resolve()
     driver = _driver()
     package_dir, package = _package(file)
@@ -62,7 +63,7 @@ def rust_cfg(file: pathlib.Path, function: str) -> dict:
         out = pathlib.Path(tmp) / "cfg.json"
         env = os.environ | {
             "RUSTC_WORKSPACE_WRAPPER": str(driver),
-            "CODEFLOW_FN": function,
+            "CODEFLOW_LINE" if isinstance(function, int) else "CODEFLOW_FN": str(function),
             "CODEFLOW_FILE": str(file),
             "CODEFLOW_OUT": str(out),
             "CARGO_TARGET_DIR": str(workspace / "target" / "codeflow"),

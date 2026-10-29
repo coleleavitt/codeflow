@@ -1,0 +1,11 @@
+[package]
+name = "codeflow-rustc-driver"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[package.metadata.rust-analyzer]
+rustc_private = true

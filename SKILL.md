@@ -1,0 +1,55 @@
+---
+name: codeflow
+description: "Call trees (what a function calls, who calls it) and per-function control-flow graphs (every branch, loop, early return, raise) built from the code's real structure and rendered with file:line, so structural answers come from a language server, a parser or the compiler instead of grep and guessing. Rust, Python, C/C++ and TypeScript call trees go through the session's language servers; JavaScript (bundles and deobfuscated chunks too) through acorn. Control-flow graphs: Python ast, JavaScript acorn, C/C++ tree-sitter, Rust MIR via rustc_public. Use it whenever a question is about control flow, callers, callees, what links to what, every path through a function, or how a feature is wired."
+---
+
+# codeflow
+
+```python
+print(await codeflow.tree("crates/pa-tui/src/session_ui/queue.rs", "send_now"))            # what it calls
+print(await codeflow.tree("src/server.py", "handle", direction="incoming", depth=2))      # who calls it
+print(await codeflow.tree("chunk.deob.js", "$9t.sendQueuedNow", depth=4))                 # a JS bundle
+print(await codeflow.cfg("src/rlm/repl.py", "_run_guarded"))                              # every path through one function
+```
+
+`cfg(path, function, *, level="source", cleanup=False)` prints one line per block: `B3  :1081  if <condition>` with its edges
+(`true → B4`, `loop`, `done`, `exception`, `return`, `then re-raise`, `case X`, `goto L`; `↺` a loop back-edge,
+`← B1, B2` where paths join). Python `finally`, JS `finally`, C `goto`/`switch` fall-through and C++ `try` are
+modelled. Rust graphs come from the compiler's MIR (`?`, match arms and drops are real blocks; calls resolve to the
+concrete impl); the first call per workspace compiles it in `target/codeflow` (minutes), later calls only the crate
+(10-60 s on prime-agent). Rust `level`: `"source"` reads like the code; `"async"` adds the async state machine (state
+dispatch, `resume #k` edges, each `.await`'s Ready/Pending with the suspend to the executor); `"mir"` is the compiler's
+graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds unwind paths at any level.
+
+- `at`: a symbol name (`"Class.method"` / `"Class.#private"` in JS), a 1-based line, or `"line:col"`.
+- `direction`: `"outgoing"` (default) or `"incoming"`. `depth`: levels (default 3).
+- LSP trees expand only functions under `root` (default: the file's git root); `external=True` lists calls into
+  dependencies and std as one leaf line.
+- The result prints as a tree (`name  path:line  (at <call lines>)`, `↺` a cycle, `(expanded above)` a repeat);
+  `.edges` is `[(caller, callee, "path:line"), ...]`.
+
+## Which tool for which question
+
+| Question | Use |
+|---|---|
+| What does X call / who calls X / how is a feature wired | `codeflow.tree` |
+| Every path through X: branches, early returns, loops, error paths | `codeflow.cfg` |
+| Where is X defined, its type or signature | `rlm.lsp.definition`, `rlm.lsp.hover` |
+| Every use of X | `rlm.lsp.references` |
+| A file's outline | `rlm.lsp.document_symbols` |
+| Guards, every-path checks, C cleanup paths, tree-sitter queries | the `ast-walk` skill (`refs.py`, `guards.py`, `paths.py`) |
+| A minified bundle | deobfuscate first (`jsbeautify -d`, the `jsbeautify` skill), then `codeflow.tree` on the output |
+| A string, a log message, a config key | grep is right |
+
+## Limits
+
+- Syntax and server facts only: dynamic dispatch, callbacks stored in data, and macros may be missing; say so when
+  a conclusion depends on them. The JS walker resolves top-level functions and `this.` methods of the same class;
+  `obj.method()` on other objects is left out.
+- LSP trees need the language's server in `lspServers` (`await rlm.lsp.servers()`: rust-analyzer, pyright, clangd,
+  typescript-language-server); a first call on a big Rust workspace waits for rust-analyzer to index. clangd needs a
+  `compile_commands.json` (project root or `build/`) to resolve calls across files.
+- Python, JS and C control-flow graphs are syntax-level: a macro or helper that exits (`GGML_ASSERT`, `BUG_ON`,
+  `sys.exit`) is a plain statement, not a branch. Rust's MIR graphs have no such gap.
+- JS needs `node` and `acorn` (`npm ci` in `src/codeflow` after a fresh clone); C needs `uv` (tree-sitter grammars are pinned in
+  `ccfg.py`'s script header); Rust needs the `rustc-master` toolchain (the driver rebuilds itself when it changes).

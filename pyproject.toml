@@ -1,0 +1,13 @@
+[project]
+name = "codeflow"
+version = "0.1.0"
+description = "Call trees from language servers (rlm.lsp) and acorn, rendered with file:line"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codeflow"]

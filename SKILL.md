@@ -1,6 +1,6 @@
 ---
 name: codeflow
-description: "Call trees (what a function calls, who calls it) and per-function control-flow graphs (every branch, loop, early return, raise) built from the code's real structure and rendered with file:line, so structural answers come from a language server, a parser or the compiler instead of grep and guessing. Rust, Python, C/C++ and TypeScript call trees go through the session's language servers; JavaScript (bundles and deobfuscated chunks too) through acorn. Control-flow graphs: Python ast, JavaScript acorn, C/C++ tree-sitter, Rust MIR via rustc_public. Use it whenever a question is about control flow, callers, callees, what links to what, every path through a function, or how a feature is wired."
+description: "Call trees and per-function control-flow graphs from the code's real structure, rendered with file:line: who calls a function, what it calls, and every path through it (branches, loops, early returns, raises, never-returning calls). Use it instead of grep for control flow, callers, callees, what links to what, or how a feature is wired. codeflow.tree uses the session's language servers (Rust, Python, C/C++, TypeScript/JavaScript, Go, Dart, Java, C#, Swift) and acorn for JS bundles; codeflow.cfg uses Python ast, acorn (JS/TS), LLVM IR with the project's compile flags (C/C++) and rustc MIR via rustc_public (Rust), by function name or by line, with follow=N to nest callee graphs."
 ---
 
 # codeflow

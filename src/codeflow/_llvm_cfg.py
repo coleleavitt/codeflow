@@ -15,7 +15,10 @@ _DROP = re.compile(r"^(-c|-MD|-MMD|-MP|-O\S*|-g\S*|-W\S*|-pedantic\S*|-flto\S*|-
 _DILOC = re.compile(r"^!(\d+) = (?:distinct )?!DILocation\(line: (\d+), column: (\d+)")
 _LABEL = re.compile(r"^([\w.\-$]+):(?:\s|$)")
 _DBG = re.compile(r"!dbg !(\d+)")
-_CALL = re.compile(r"\b(?:call|invoke)\b[^@]*@\"?([\w.$]+)\"?\(")
+_CALL = re.compile(r"\b(?:call|invoke)\b[^@%]*@\"?([\w.$]+)\"?\(")
+_INDIRECT = re.compile(r"\b(?:call|invoke)\b[^@]*?\s%[\w.\-$]+\(")
+# Exception-handling plumbing the source never spells out.
+_EH_PLUMBING = {"__cxa_begin_catch", "__cxa_end_catch", "__cxa_rethrow", "__cxa_free_exception"}
 _TARGET = re.compile(r"label %([\w.\-$]+)")
 
 
@@ -83,6 +86,7 @@ def llvm_cfg(file: Path, function: str) -> dict | None:
     begin, name = chosen[0]
     end = next(i for i in range(begin, len(ir)) if ir[i] == "}")
     body = ir[begin + 1 : end]
+    readable |= _demangle(sorted({m.group(1) for line in body if (m := _CALL.search(line))} - set(readable)))
 
     order: list[str] = []
     text: dict[str, list[str]] = {}
@@ -109,11 +113,13 @@ def llvm_cfg(file: Path, function: str) -> dict | None:
             if dbg and dbg.group(1) in locations:
                 lines_seen.append(locations[dbg.group(1)][0])
             call = _CALL.search(instr)
-            if call and not call.group(1).startswith("llvm."):
+            if call and not call.group(1).startswith("llvm.") and call.group(1) not in _EH_PLUMBING:
                 callee = readable.get(call.group(1), call.group(1)).split("(")[0]
                 steps.append(f"call {callee}(..)")
                 if k + 1 < len(text[label]) and text[label][k + 1].startswith("unreachable"):
                     noreturn = callee
+            elif call is None and _INDIRECT.search(instr):
+                steps.append("call (indirect)(..)")
         dbg = _DBG.search(terminator)
         at = locations.get(dbg.group(1)) if dbg else None
         test = None
@@ -156,6 +162,33 @@ def llvm_cfg(file: Path, function: str) -> dict | None:
             "succ": succ, "cleanup": False,
         })
     blocks.append({"id": exit_id, "lines": None, "kind": "exit", "label": "exit", "succ": [], "cleanup": False})
+    _mark_cleanup(blocks, exit_id)
     first_line = min((b["lines"][0] for b in blocks if b["lines"]), default=0)
     return {"function": readable.get(name, name).split("(")[0], "file": str(file), "line": first_line,
             "entry": 0, "blocks": blocks, "negation_folded": False, "source": "LLVM IR -O0"}
+
+
+def _mark_cleanup(blocks: list[dict], exit_id: int) -> None:
+    """Landing pads that only run destructors and rethrow are cleanup (Rust's unwind paths): marked
+    so the default view hides them. An exception edge into a real `catch` stays."""
+    by_id = {b["id"]: b for b in blocks}
+    # Blocks that can end some other way than a rethrow (return, never-returning call, a catch).
+    alive = {b["id"] for b in blocks if b["kind"] in ("return", "unreachable") or (b["kind"] == "raise" and b["label"] != "rethrow")}
+    changed = True
+    while changed:
+        changed = False
+        for b in blocks:
+            if b["id"] not in alive and b["id"] != exit_id and any(e["to"] in alive for e in b["succ"]):
+                alive.add(b["id"])
+                changed = True
+    for b in blocks:
+        for e in b["succ"]:
+            if e["label"] == "exception" and e["to"] not in alive:
+                e["label"] = "unwind"
+                todo = [e["to"]]
+                while todo:
+                    n = todo.pop()
+                    if n == exit_id or by_id[n]["cleanup"]:
+                        continue
+                    by_id[n]["cleanup"] = True
+                    todo.extend(x["to"] for x in by_id[n]["succ"])

@@ -26,6 +26,7 @@ from pathlib import Path
 __all__ = ["FlowGraph", "FlowTree", "cfg", "tree"]
 
 _JS = {".js", ".mjs", ".cjs"}
+_TS = {".ts", ".tsx", ".mts", ".cts"}
 _C = {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"}
 _HERE = Path(__file__).parent
 _WALKER = _HERE / "jsflow.mjs"
@@ -122,7 +123,7 @@ async def cfg(
         checked = await _never_returning(file, [(l, c) for l, c, _ in calls], _PY_NEVER)
         graph = await asyncio.to_thread(_cfg.py_cfg, file, function, fallback if checked is None else checked | fallback)
         graph["source"] = "ast" + ("" if checked is None else " + pyright types")
-    elif file.suffix in _JS:
+    elif file.suffix in _JS | _TS:
         walker = ["node", str(_HERE / "jscfg.mjs"), str(file), function]
         calls = await asyncio.to_thread(_run_json, [*walker, "--calls"])
         checked = await _never_returning(file, [(l, c) for l, c, _ in calls], _TS_NEVER)

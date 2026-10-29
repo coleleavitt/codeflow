@@ -12,7 +12,8 @@ print(await codeflow.tree("chunk.deob.js", "$9t.sendQueuedNow", depth=4))       
 print(await codeflow.cfg("src/rlm/repl.py", "_run_guarded"))                              # every path through one function
 ```
 
-`cfg(path, function, *, level="source", cleanup=False)` prints one line per block: `B3  :1081  if <condition>` with its edges
+`cfg(path, function, *, level="source", cleanup=False)` (.py, .js/.mjs/.cjs, .ts/.tsx/.mts/.cts, .c/.h/.cc/.cpp, .rs)
+prints one line per block: `B3  :1081  if <condition>` with its edges
 (`true → B4`, `loop`, `done`, `exception`, `return`, `then re-raise`, `case X`, `goto L`; `↺` a loop back-edge,
 `← B1, B2` where paths join). Python `finally`, JS `finally`, C `goto`/`switch` fall-through and C++ `try` are
 modelled. Rust graphs come from the compiler's MIR (`?`, match arms and drops are real blocks; calls resolve to the
@@ -38,7 +39,6 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
 | Every use of X | `rlm.lsp.references` |
 | A file's outline | `rlm.lsp.document_symbols` |
 | Guards, every-path checks, C cleanup paths, tree-sitter queries | the `ast-walk` skill (`refs.py`, `guards.py`, `paths.py`) |
-| TypeScript control flow | not yet: `cfg` reads .py/.js/.c/.cc/.rs |
 | A minified bundle | deobfuscate first (`jsbeautify -d`, the `jsbeautify` skill), then `codeflow.tree` on the output |
 | A string, a log message, a config key | grep is right |
 
@@ -51,7 +51,9 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
   typescript-language-server); a first call on a big Rust workspace waits for rust-analyzer to index. clangd needs a
   `compile_commands.json` (project root or `build/`) to resolve calls across files.
 - Each graph's header names its backend. C/C++ graphs come from LLVM IR (clang `-O0 -g` with the file's
-  `compile_commands.json` flags): macros are expanded and a `noreturn` call ends its path (`GGML_ASSERT` is a branch
+  `compile_commands.json` flags): macros are expanded, a `noreturn` call ends its path, and C++ exceptions are real
+  edges (each call in a `try` has an `exception` edge into its `catch`; destructor-only unwind paths are cleanup,
+  shown with `cleanup=True`) (`GGML_ASSERT` is a branch
   whose failing side "never returns"); without a compile command it falls back to tree-sitter and says why. Python and
   JS ask the type checker which call statements never return (pyright `NoReturn`/`Never`, tsgo `never`), falling
   back to known names (`sys.exit`, `os._exit`, `process.exit`) and same-file `NoReturn` annotations; TypeScript does
@@ -59,5 +61,5 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
 - Rust branch labels: each MIR branch tests one operand, so `a || b` is two branches, labelled `[tests a]` and
   `[tests b]`; an operand behind `!` reads like the source (rustc branches on the operand with swapped targets). C
   branches from one `&&`/`||` line are numbered `[part k of n]`.
-- JS needs `node` and `acorn` (`npm ci` in `src/codeflow` after a fresh clone); C needs `uv` (tree-sitter grammars are pinned in
+- JS/TS need `node`, `acorn` and `@sveltejs/acorn-typescript` (`npm ci` in `src/codeflow` after a fresh clone); C needs `uv` (tree-sitter grammars are pinned in
   `ccfg.py`'s script header); Rust needs the `rustc-master` toolchain (the driver rebuilds itself when it changes).

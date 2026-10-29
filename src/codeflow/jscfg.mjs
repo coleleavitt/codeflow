@@ -4,31 +4,45 @@
 // NORETURN: JSON [[line, col], ...] of callees that never return (a type checker's `never`).
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
+import { tsPlugin } from "@sveltejs/acorn-typescript";
 const require = createRequire(import.meta.url);
 const acorn = require("acorn");
-const walk = require("acorn-walk");
 
 const [file, wanted, extra] = process.argv.slice(2);
 const KNOWN_NORETURN = new Set(["process.exit", "process.abort"]);
 const src = readFileSync(file, "utf8");
+// TypeScript (.ts/.tsx/.mts/.cts) through acorn's TypeScript plugin: its statements are JavaScript's.
+const ts = /\.(c|m)?tsx?$/.test(file);
+const parser = ts ? acorn.Parser.extend(tsPlugin({ jsx: file.endsWith(".tsx") })) : acorn.Parser;
 let ast;
 for (const sourceType of ["module", "script"]) {
-  try { ast = acorn.parse(src, { ecmaVersion: "latest", sourceType, locations: true, allowHashBang: true, allowReturnOutsideFunction: true }); break; }
+  try { ast = parser.parse(src, { ecmaVersion: "latest", sourceType, locations: true, allowHashBang: true, allowReturnOutsideFunction: true }); break; }
   catch (error) { if (sourceType === "script") { console.error(String(error)); process.exit(2); } }
+}
+// Every node under `node` (a generic walk: acorn-walk does not know the TypeScript node types).
+function* nodes(node) {
+  if (!node || typeof node.type !== "string") return;
+  yield node;
+  for (const k in node) {
+    if (k === "loc" || k === "range" || k === "start" || k === "end") continue;
+    const v = node[k];
+    if (Array.isArray(v)) { for (const c of v) if (c && typeof c.type === "string") yield* nodes(c); }
+    else if (v && typeof v.type === "string") yield* nodes(v);
+  }
 }
 const key = (k) => k.type === "PrivateIdentifier" ? "#" + k.name : k.type === "Identifier" ? k.name : k.type === "Literal" ? String(k.value) : null;
 const isFn = (n) => n && /Function/.test(n.type);
 let target = null, targetName = wanted;
 const [cls, method] = wanted.includes(".") ? wanted.split(/\.(.*)/) : [null, wanted];
-walk.full(ast, (n) => {
-  if (target) return;
+for (const n of nodes(ast)) {
+  if (target) break;
   if (!cls) {
-    if (n.type === "FunctionDeclaration" && n.id?.name === method) target = n;
+    if (n.type === "FunctionDeclaration" && n.id?.name === method && n.body) target = n;
     else if (n.type === "VariableDeclarator" && n.id.type === "Identifier" && n.id.name === method && isFn(n.init)) target = n.init;
   } else if ((n.type === "ClassDeclaration" || n.type === "ClassExpression") && n.id?.name === cls) {
-    for (const m of n.body.body) if (key(m.key) === method && (m.type === "MethodDefinition" || isFn(m.value))) target = m.value;
+    for (const m of n.body.body) if (m.key && key(m.key) === method && (m.type === "MethodDefinition" || isFn(m.value)) && m.value?.body) target = m.value;
   }
-});
+}
 if (!target) { console.error(`no function ${wanted} in ${file}`); process.exit(3); }
 
 const calleePos = (call) => {
@@ -37,12 +51,12 @@ const calleePos = (call) => {
   return [at.loc.start.line, at.loc.start.column + 1];
 };
 const callStatements = [];
-walk.full(target.body, (n) => {
+for (const n of nodes(target.body)) {
   if (n.type === "ExpressionStatement" && n.expression.type === "CallExpression") {
     const [line, col] = calleePos(n.expression);
     callStatements.push([line, col, src.slice(n.expression.callee.start, n.expression.callee.end)]);
   }
-});
+}
 if (extra === "--calls") { console.log(JSON.stringify(callStatements)); process.exit(0); }
 const noreturn = new Set((extra ? JSON.parse(extra) : []).map(([l, c]) => `${l}:${c}`));
 for (const [l, c, name] of callStatements) if (KNOWN_NORETURN.has(name)) noreturn.add(`${l}:${c}`);

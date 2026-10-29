@@ -56,7 +56,11 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
   (rust-analyzer), Python (pyright), C/C++ (clangd), TypeScript/JavaScript (TS 7 `tsc --lsp`), Go (gopls), Dart,
   Java (jdtls), C# (csharp-ls), Swift (sourcekit-lsp). Lua, Zig, PHP and Bash servers answer `rlm.lsp` definitions,
   references and hover but have no call hierarchy; a first call on a big Rust workspace waits for rust-analyzer to index. clangd needs a
-  `compile_commands.json` (project root or `build/`) to resolve calls across files.
+  `compile_commands.json` (project root or `build/`) to resolve calls across files; incoming calls need its
+  background index, which fills in over the first minutes on a big tree. In a built Linux tree codeflow writes
+  `compile_commands.json` itself (`scripts/clang-tools/gen_compile_commands.py`, about a second); elsewhere CMake
+  (`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`), Meson or `intercept-build make` make one. GCC-only flags clang rejects are
+  dropped (codeflow retries without them; `~/.config/clangd/config.yaml` removes them for clangd).
 - Each graph's header names its backend. C/C++ graphs come from LLVM IR (clang `-O0 -g` with the file's
   `compile_commands.json` flags): macros are expanded, a `noreturn` call ends its path, and C++ exceptions are real
   edges (each call in a `try` has an `exception` edge into its `catch`; destructor-only unwind paths are cleanup,

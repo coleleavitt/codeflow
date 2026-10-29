@@ -4,6 +4,7 @@ rustc's MIR does for Rust."""
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shlex
@@ -13,6 +14,7 @@ from pathlib import Path
 _DROP_WITH_VALUE = {"-o", "-MF", "-MT", "-MQ"}
 _DROP = re.compile(r"^(-c|-MD|-MMD|-MP|-O\S*|-g\S*|-W\S*|-pedantic\S*|-flto\S*|-fsanitize\S*|-fprofile\S*)$")
 _DILOC = re.compile(r"^!(\d+) = (?:distinct )?!DILocation\(line: (\d+), column: (\d+)")
+_INLINED_AT = re.compile(r"inlinedAt: !(\d+)")
 _LABEL = re.compile(r"^([\w.\-$]+):(?:\s|$)")
 _DBG = re.compile(r"!dbg !(\d+)")
 _CALL = re.compile(r"\b(?:call|invoke)\b[^@%]*@\"?([\w.$]+)\"?\(")
@@ -22,17 +24,38 @@ _EH_PLUMBING = {"__cxa_begin_catch", "__cxa_end_catch", "__cxa_rethrow", "__cxa_
 _TARGET = re.compile(r"label %([\w.\-$]+)")
 
 
+def _kernel_database(file: Path) -> None:
+    """A built Linux tree has no compile_commands.json until `make compile_commands.json`; write it from the
+    build's .cmd files (about a second, git-ignored) so the file compiles with its real flags."""
+    for directory in file.parents:
+        script = directory / "scripts/clang-tools/gen_compile_commands.py"
+        if script.is_file() and (directory / "Kbuild").is_file():
+            built = (file.parent / f".{file.stem}.o.cmd").is_file()
+            if built and not (directory / "compile_commands.json").exists():
+                subprocess.run(["python3", str(script)], cwd=directory, capture_output=True, timeout=600)
+            return
+
+
+@functools.cache
+def _database(path: Path, mtime: float) -> dict[Path, tuple[Path, list[str]]]:
+    commands = {}
+    for entry in json.loads(path.read_text()):
+        argv = entry.get("arguments") or shlex.split(entry["command"])
+        commands[Path(entry["directory"], entry["file"]).resolve()] = (Path(entry["directory"]), argv)
+    return commands
+
+
 def compile_command(file: Path) -> tuple[Path, list[str]] | None:
     """The file's compile command from the nearest compile_commands.json (the project root, ``build*/``)."""
+    _kernel_database(file)
     for directory in file.parents:
         for database in [directory / "compile_commands.json", *sorted(directory.glob("build*/compile_commands.json"))]:
-            if not database.is_file():
-                continue
-            for entry in json.loads(database.read_text()):
-                if Path(entry["directory"], entry["file"]).resolve() == file:
-                    argv = entry.get("arguments") or shlex.split(entry["command"])
-                    return Path(entry["directory"]), argv
+            if database.is_file() and (found := _database(database, database.stat().st_mtime).get(file)):
+                return found
     return None
+
+
+_REJECTED = re.compile(r"(?:unknown argument:|unsupported option) '([^']+)'")
 
 
 def _ir(file: Path, directory: Path, argv: list[str]) -> str:
@@ -48,12 +71,20 @@ def _ir(file: Path, directory: Path, argv: list[str]) -> str:
         if _DROP.match(arg) or Path(directory, arg).resolve() == file:
             continue
         args.append(arg)
-    command = ["clang++" if cpp else "clang", *args, "-w", "-Qunused-arguments", "-O0", "-g",
-               "-fno-discard-value-names", "-S", "-emit-llvm", "-o", "-", str(file)]
-    run = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=600)
-    if run.returncode != 0:
-        raise RuntimeError("clang could not compile the file to LLVM IR:\n" + run.stderr[-1500:])
-    return run.stdout
+    # A GCC-built project (the kernel) passes code-generation flags clang does not know; none of them
+    # change the control flow, so drop the ones clang names and compile again.
+    for _ in range(3):
+        command = ["clang++" if cpp else "clang", *args, "-w", "-Qunused-arguments", "-O0", "-g",
+                   "-fno-discard-value-names", "-S", "-emit-llvm", "-o", "-", str(file)]
+        run = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=600)
+        if run.returncode == 0:
+            return run.stdout
+        rejected = {match.group(1) for match in _REJECTED.finditer(run.stderr)}
+        if not rejected:
+            break
+        args = [arg for arg in args if arg not in rejected]
+    first = next((line for line in run.stderr.splitlines() if "error" in line), run.stderr.strip()[:200])
+    raise RuntimeError(f"clang could not compile the file to LLVM IR: {first.strip()}")
 
 
 def _demangle(names: list[str]) -> dict[str, str]:
@@ -70,11 +101,20 @@ def llvm_cfg(file: Path, function: str) -> dict | None:
     if found is None:
         return None
     ir = _ir(file, *found).splitlines()
-    locations = {}
+    locations, inlined_at = {}, {}
     for line in ir:
         match = _DILOC.match(line)
         if match:
             locations[match.group(1)] = (int(match.group(2)), int(match.group(3)))
+            if (outer := _INLINED_AT.search(line)):
+                inlined_at[match.group(1)] = outer.group(1)
+    # Header code inlined into the function (a guard()'s always_inline constructor) carries the
+    # header's line; the line in this function is at the end of its inlinedAt chain.
+    for node in list(locations):
+        outer = node
+        while outer in inlined_at:
+            outer = inlined_at[outer]
+        locations[node] = locations[outer]
     starts = [(i, m.group(1)) for i, line in enumerate(ir) if line.startswith("define ") and (m := re.search(r'@"?([\w.$]+)"?\(', line))]
     readable = _demangle([name for _, name in starts])
     def matches(name: str) -> bool:

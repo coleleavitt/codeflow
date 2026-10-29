@@ -177,9 +177,10 @@ async def cfg(
             function = name_run.stdout.strip().split("::")[-1] if "::" not in name_run.stdout else name_run.stdout.strip()
         try:
             graph = await asyncio.to_thread(llvm_cfg, file, function)
-            reason = "no compile_commands.json" if graph is None else ""
+            reason = ("no compile_commands.json (CMake: -DCMAKE_EXPORT_COMPILE_COMMANDS=ON; Meson writes one; "
+                      "otherwise `intercept-build make`)") if graph is None else ""
         except (RuntimeError, LookupError) as error:
-            graph, reason = None, str(error).splitlines()[0][:120]
+            graph, reason = None, str(error).splitlines()[0][:240]
         if graph is not None:
             graph = _cfg.ir_tidy(graph, cleanup=cleanup)
         else:

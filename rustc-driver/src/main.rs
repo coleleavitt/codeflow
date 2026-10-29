@@ -121,6 +121,7 @@ fn dump(query: &str, file: Option<&Path>) -> Result<Value, String> {
             json!({
                 "id": id,
                 "lines": cfg.lines(block),
+                "test": cfg.test_span(block),
                 "kind": kind,
                 "label": label,
                 "succ": succ.into_iter().map(|(to, label)| json!({"to": to, "label": label})).collect::<Vec<_>>(),
@@ -182,12 +183,26 @@ impl Cfg<'_> {
         let mut range: Option<[usize; 2]> = None;
         for span in spans.filter(|s| span_file(s) == self.file) {
             let l = span.get_lines();
+            if l.start_line == 0 {
+                continue; // a dummy span (compiler-made statements)
+            }
             range = Some(match range {
                 None => [l.start_line, l.end_line],
                 Some([a, b]) => [a.min(l.start_line), b.max(l.end_line)],
             });
         }
         range
+    }
+
+    /// What a branch tests, as `[start_line, start_col, end_line, end_col]` in the function's file:
+    /// for `a || b` each operand's branch has its own span.
+    fn test_span(&self, block: &BasicBlock) -> Option<[usize; 4]> {
+        let TerminatorKind::SwitchInt { .. } = block.terminator.kind else { return None };
+        let span = &block.terminator.source_info.span;
+        (span_file(span) == self.file).then(|| {
+            let l = span.get_lines();
+            [l.start_line, l.start_col, l.end_line, l.end_col]
+        })
     }
 
     fn place(&self, place: &Place) -> String {

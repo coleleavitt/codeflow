@@ -1,12 +1,15 @@
 // Statement-level control-flow graph of one JavaScript function (acorn), in codeflow's shape.
-// Usage: node jscfg.mjs FILE NAME   (NAME: a function, a variable bound to one, or "Class.method")
+// Usage: node jscfg.mjs FILE NAME [NORETURN]   (NAME: a function, a variable bound to one, or "Class.method")
+//        node jscfg.mjs FILE NAME --calls      the call statements, as [[line, col, callee], ...]
+// NORETURN: JSON [[line, col], ...] of callees that never return (a type checker's `never`).
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 const require = createRequire(import.meta.url);
 const acorn = require("acorn");
 const walk = require("acorn-walk");
 
-const [file, wanted] = process.argv.slice(2);
+const [file, wanted, extra] = process.argv.slice(2);
+const KNOWN_NORETURN = new Set(["process.exit", "process.abort"]);
 const src = readFileSync(file, "utf8");
 let ast;
 for (const sourceType of ["module", "script"]) {
@@ -28,6 +31,21 @@ walk.full(ast, (n) => {
 });
 if (!target) { console.error(`no function ${wanted} in ${file}`); process.exit(3); }
 
+const calleePos = (call) => {
+  const c = call.callee;
+  const at = c.type === "MemberExpression" ? c.property : c;
+  return [at.loc.start.line, at.loc.start.column + 1];
+};
+const callStatements = [];
+walk.full(target.body, (n) => {
+  if (n.type === "ExpressionStatement" && n.expression.type === "CallExpression") {
+    const [line, col] = calleePos(n.expression);
+    callStatements.push([line, col, src.slice(n.expression.callee.start, n.expression.callee.end)]);
+  }
+});
+if (extra === "--calls") { console.log(JSON.stringify(callStatements)); process.exit(0); }
+const noreturn = new Set((extra ? JSON.parse(extra) : []).map(([l, c]) => `${l}:${c}`));
+for (const [l, c, name] of callStatements) if (KNOWN_NORETURN.has(name)) noreturn.add(`${l}:${c}`);
 const blocks = [];
 const text = (n, limit = 60) => { const s = src.slice(n.start, n.end).replace(/\s+/g, " "); return s.length <= limit ? s : s.slice(0, limit - 1) + "…"; };
 const block = (kind = "goto", label = "") => { const b = { id: blocks.length, lines: null, kind, label, succ: [], cleanup: false }; blocks.push(b); return b; };
@@ -117,12 +135,17 @@ function stmt(n, cur, ctx) {
         const normal = blocks.some((b) => b.succ.some((e) => e.to === fin.id && !fin.carries.has(e.label)));
         if (normal) link(fend, after);
         if (fin.carries.has("return")) leave(fend, ctx.returnTo, "then return");
-        if (fin.carries.has("throw")) leave(fend, ctx.raiseTo, "then rethrow");
+        if (fin.carries.has("throw") || fin.carries.has("never returns")) leave(fend, ctx.raiseTo, "then rethrow");
         if (!normal) return null;
       }
       return reached(after) ? after : null;
     }
-    default: cover(cur, n); return cur;
+    default:
+      if (n.type === "ExpressionStatement" && n.expression.type === "CallExpression" && noreturn.has(calleePos(n.expression).join(":"))) {
+        cover(cur, n); cur.kind = "raise"; cur.label = `${text(n.expression.callee)}() never returns`;
+        leave(cur, ctx.raiseTo, "never returns"); return null;
+      }
+      cover(cur, n); return cur;
   }
 }
 const entry = block();

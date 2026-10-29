@@ -15,9 +15,46 @@ from pathlib import Path
 # ---- Python (ast) ------------------------------------------------------------
 
 
+_KNOWN_NORETURN = {"sys.exit", "exit", "quit", "os._exit", "os.abort", "os.execv", "os.execvp", "os.execve"}
+
+
+def callee_position(call: ast.Call) -> tuple[int, int]:
+    """Where a language server's hover names the called function: the attribute or the name."""
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        return func.end_lineno, func.end_col_offset - len(func.attr) + 1
+    return func.lineno, func.col_offset + 1
+
+
+def statement_calls(file: Path, name: str) -> list[tuple[int, int, str]]:
+    """The calls that stand as statements in ``name`` (the ones that can end a path), with the
+    position to hover and the callee text."""
+    source = file.read_text(errors="replace")
+    function = _find_def(ast.parse(source, str(file)), name)
+    if function is None:
+        return []
+    found = []
+    for node in ast.walk(function):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            line, col = callee_position(node.value)
+            found.append((line, col, ast.get_source_segment(source, node.value.func) or ""))
+    return found
+
+
+def local_noreturn(file: Path) -> set[str]:
+    """Functions in the file annotated ``-> NoReturn`` / ``-> Never``."""
+    names = set()
+    for node in ast.walk(ast.parse(file.read_text(errors="replace"))):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns is not None:
+            if re.search(r"\b(NoReturn|Never)\b", ast.unparse(node.returns)):
+                names.add(node.name)
+    return names
+
+
 class _Builder:
-    def __init__(self, source: str) -> None:
+    def __init__(self, source: str, noreturn: set[tuple[int, int]] = frozenset()) -> None:
         self.source = source
+        self.noreturn = noreturn
         self.blocks: list[dict] = []
         self.exit = self.new("exit", "exit")
 
@@ -169,7 +206,7 @@ class _Builder:
                     self.link(fend, after)
                 if "return" in final["_carries"]:
                     self.leave(fend, ctx["return_to"], "then return")
-                if final["_carries"] & {"raise", "unhandled"}:
+                if final["_carries"] & {"raise", "unhandled", "never returns"}:
                     self.leave(fend, ctx["raise_to"], "then re-raise")
                 if not normal:
                     return None
@@ -197,6 +234,11 @@ class _Builder:
             self.link(cur, nxt, "ok")
             self.leave(cur, ctx["raise_to"], "AssertionError")
             return nxt
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and callee_position(node.value) in self.noreturn:
+            self.cover(cur, node)
+            cur["kind"], cur["label"] = "raise", f"{self.text(node.value.func)}() never returns"
+            self.leave(cur, ctx["raise_to"], "never returns")
+            return None
         self.cover(cur, node)  # a plain statement (nested defs and classes included)
         return cur
 
@@ -215,12 +257,13 @@ def _find_def(tree: ast.AST, name: str) -> ast.FunctionDef | ast.AsyncFunctionDe
     return found
 
 
-def py_cfg(file: Path, name: str) -> dict:
+def py_cfg(file: Path, name: str, noreturn: set[tuple[int, int]] = frozenset()) -> dict:
+    """``noreturn``: the (line, col) of calls that never return (``callee_position``)."""
     source = file.read_text(errors="replace")
     function = _find_def(ast.parse(source, str(file)), name)
     if function is None:
         raise LookupError(f"no function {name!r} in {file}")
-    builder = _Builder(source)
+    builder = _Builder(source, set(noreturn))
     entry = builder.new("goto", "")
     end = builder.seq(function.body, entry, {"loops": [], "raise_to": builder.exit, "return_to": builder.exit})
     if end is not None:
@@ -280,7 +323,8 @@ def render(graph: dict, base: Path | None = None) -> str:
     for block in graph["blocks"]:
         for edge in block["succ"]:
             preds.setdefault(edge["to"], []).append(names[block["id"]])
-    out = [f"{graph['function']}  {file}:{graph['line']}   [control flow, {len(graph['blocks'])} blocks]"]
+    backend = f", {graph['source']}" if graph.get("source") else ""
+    out = [f"{graph['function']}  {file}:{graph['line']}   [control flow, {len(graph['blocks'])} blocks{backend}]"]
     for block in graph["blocks"]:
         name = names[block["id"]]
         lines = block["lines"]
@@ -324,8 +368,8 @@ def _postdominators(blocks: dict[int, dict], entry: int) -> dict[int, set[int]]:
     return pdom
 
 
-def rust_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dict:
-    """Rust MIR in source terms. ``level="source"``: the async body from its start, each `.await` one
+def ir_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dict:
+    """A compiler IR graph (Rust MIR, LLVM IR) in source terms. ``level="source"``: the async body from its start, each `.await` one
     step, macro internals (blocks with no source line) collapsed, drops and await plumbing hidden,
     straight-line runs merged, each branch labelled with its source line. ``level="async"``: the same,
     keeping the async state machine (the state dispatch and its resume edges; each `.await` as a
@@ -386,26 +430,56 @@ def rust_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> d
             joins = sorted(pdom[n] - {n}, key=lambda m: len(pdom[m]), reverse=True)
             if joins:
                 b["kind"], b["label"], b["succ"] = "goto", "", [{"to": joins[0], "label": ""}]
-    # Branch labels from the source line. rustc lowers `if !c` by branching on `c` with the targets
-    # swapped, so a bool branch whose source condition starts with `!` gets its edge labels flipped
-    # to read like the source.
+    # Branch labels from the source. Each MIR branch tests one operand (`a || b` is two branches),
+    # and the driver gives that operand's span: the label names it. rustc lowers `!c` by branching
+    # on `c` with the targets swapped, so an operand preceded by `!` gets its edges flipped back.
     for b in blocks.values():
-        if b["kind"] == "switch" and b["lines"] and source and not b["label"].startswith(("await", "async state")):
-            line = source[b["lines"][0] - 1].strip().rstrip("{").strip()
-            if not line:
-                continue
-            condition = re.sub(r"^(?:\}\s*else\s+)?(?:if|while)\s+", "", line)
-            if condition.startswith("!") and sorted(e["label"] for e in b["succ"]) == ["false", "true"]:
+        if b["kind"] != "switch" or not b["lines"] or not source or b["label"].startswith(("await", "async state")):
+            continue
+        row_no = b["test"][0] if b.get("test") else b["lines"][0]  # the branch's own line, not the block's first
+        line = source[row_no - 1].strip().rstrip("{").strip()
+        if not line:
+            continue
+        condition = re.sub(r"^(?:\}\s*else\s+)?(?:if|while)\s+", "", line)
+        boolean = sorted(e["label"] for e in b["succ"]) == ["false", "true"]
+        tested = None
+        span = b.get("test") if graph.get("negation_folded", True) else None
+        if span and span[0] == span[2] and span[0] <= len(source):
+            row = source[span[0] - 1]
+            tested = row[span[1] - 1 : span[3] - 1]
+            if boolean and graph.get("negation_folded", True) and row[: span[1] - 1].rstrip().endswith("!"):
+                tested = "!" + tested
                 for e in b["succ"]:
                     e["label"] = "true" if e["label"] == "false" else "false"
-            b["label"] = line if len(line) <= 70 else line[:69] + "…"
+        elif boolean and condition.startswith("!") and graph.get("negation_folded", True):
+            for e in b["succ"]:
+                e["label"] = "true" if e["label"] == "false" else "false"
+        shown = line if len(line) <= 70 else line[:69] + "…"
+        b["label"] = shown if not tested or tested.strip() == condition.strip() else f"{shown}   [tests {tested}]"
+    if not graph.get("negation_folded", True):
+        # LLVM IR keeps each operand's own condition; its column is not reliable enough to slice
+        # the operand, so several branches from one `&&`/`||` line are numbered in column order.
+        by_line: dict[int, list[dict]] = {}
+        for b in blocks.values():
+            if b["kind"] == "switch" and b.get("test") and len(b["succ"]) == 2:
+                by_line.setdefault(b["test"][0], []).append(b)
+        for row, parts in by_line.items():
+            if len(parts) > 1 and source and re.search(r"&&|\|\|", source[row - 1]):
+                for k, b in enumerate(sorted(parts, key=lambda b: b["test"][1]), 1):
+                    b["label"] = f"{b['label']}   [part {k} of {len(parts)}]"
+    # MIR sends every `return` through one shared block: the block that sets the value says it.
+    for b in blocks.values():
+        if not b["label"] and b["lines"] and source:
+            last = source[b["lines"][1] - 1].strip()
+            if re.match(r"return\b", last):
+                b["label"] = last.rstrip(";")
     # Merge straight-line runs: a single-exit block into its single-entry successor.
     live = _reachable(blocks, entry)
     preds: dict[int, int] = {}
     for n in live:
         for e in blocks[n]["succ"]:
             preds[e["to"]] = preds.get(e["to"], 0) + 1
-    steps = {n: ([blocks[n]["label"]] if blocks[n]["label"] else []) for n in live}
+    steps = {n: list(blocks[n].get("steps") or []) + ([blocks[n]["label"]] if blocks[n]["label"] else []) for n in live}
     merged_into: dict[int, int] = {}
     for n in sorted(live, key=lambda m: m != entry):
         b = blocks[n]
@@ -431,6 +505,8 @@ def rust_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> d
             b["kind"], b["succ"] = "raise", [{"to": -1, "label": "panic"}]
             b["label"] = "panic: " + b["label"].removeprefix("assert: ")
     exit_block = {"id": -1, "lines": None, "kind": "exit", "label": "exit", "succ": [], "cleanup": False}
+    if any(b["kind"] == "exit" for b in kept):
+        return dict(graph, entry=entry, blocks=kept)
     for b in kept:
         if b["kind"] == "return" and not b["succ"]:
             b["succ"] = [{"to": -1, "label": "return"}]
@@ -464,3 +540,6 @@ def _summarize(steps: list[str]) -> str:
     if "return" in steps:
         parts.append("return")
     return " · ".join(parts)
+
+
+rust_tidy = ir_tidy

@@ -116,19 +116,63 @@ async def cfg(
     if not file.is_file():
         raise FileNotFoundError(file)
     if file.suffix == ".py":
-        graph = await asyncio.to_thread(_cfg.py_cfg, file, function)
+        calls = _cfg.statement_calls(file, function)
+        local = _cfg.local_noreturn(file)
+        fallback = {(l, c) for l, c, name in calls if name in _cfg._KNOWN_NORETURN or name.split(".")[-1] in local}
+        checked = await _never_returning(file, [(l, c) for l, c, _ in calls], _PY_NEVER)
+        graph = await asyncio.to_thread(_cfg.py_cfg, file, function, fallback if checked is None else checked | fallback)
+        graph["source"] = "ast" + ("" if checked is None else " + pyright types")
     elif file.suffix in _JS:
-        graph = await asyncio.to_thread(_run_json, ["node", str(_HERE / "jscfg.mjs"), str(file), function])
+        walker = ["node", str(_HERE / "jscfg.mjs"), str(file), function]
+        calls = await asyncio.to_thread(_run_json, [*walker, "--calls"])
+        checked = await _never_returning(file, [(l, c) for l, c, _ in calls], _TS_NEVER)
+        graph = await asyncio.to_thread(_run_json, [*walker, json.dumps(sorted(checked or []))])
+        graph["source"] = "acorn" + ("" if checked is None else " + tsgo types")
     elif file.suffix in _C:
-        graph = await asyncio.to_thread(_run_json, ["uv", "run", "--quiet", "--script", str(_HERE / "ccfg.py"), str(file), function])
+        from ._llvm_cfg import llvm_cfg
+
+        try:
+            graph = await asyncio.to_thread(llvm_cfg, file, function)
+            reason = "no compile_commands.json" if graph is None else ""
+        except (RuntimeError, LookupError) as error:
+            graph, reason = None, str(error).splitlines()[0][:120]
+        if graph is not None:
+            graph = _cfg.ir_tidy(graph, cleanup=cleanup)
+        else:
+            graph = await asyncio.to_thread(_run_json, ["uv", "run", "--quiet", "--script", str(_HERE / "ccfg.py"), str(file), function])
+            graph["source"] = f"tree-sitter, syntax only: {reason}"
     elif file.suffix == ".rs":
         from ._rust_cfg import rust_cfg
 
-        graph = _cfg.rust_tidy(await asyncio.to_thread(rust_cfg, file, function), cleanup=cleanup, level=level)
+        graph = _cfg.ir_tidy(await asyncio.to_thread(rust_cfg, file, function), cleanup=cleanup, level=level)
+        graph["source"] = "rustc MIR"
     else:
         raise ValueError(f"no control-flow backend for {file.suffix} files")
     simple = _cfg.simplify(graph, cleanup=cleanup)
     return FlowGraph(str(graph["function"]), _cfg.render(simple, _root(file, root)), simple)
+
+
+_PY_NEVER = re.compile(r"->\s*(?:NoReturn|Never)\b")
+_TS_NEVER = re.compile(r"(?:\)\s*:|=>)\s*never\b")
+_MAX_HOVERS = 60
+
+
+async def _never_returning(file: Path, positions: list[tuple[int, int]], never: re.Pattern) -> set[tuple[int, int]] | None:
+    """The positions whose callee the language server types as never returning, or None when no
+    server answers for the file (the caller falls back to known names)."""
+    from rlm import lsp
+
+    found: set[tuple[int, int]] = set()
+    for line, col in positions[:_MAX_HOVERS]:
+        try:
+            answer = await lsp.hover(str(file), line, col)
+        except Exception:  # noqa: BLE001 - no server, or it failed: syntax only
+            return None
+        if not answer.available:
+            return None
+        if never.search(answer.text):
+            found.add((line, col))
+    return found
 
 
 def _run_json(command: list[str]) -> dict:

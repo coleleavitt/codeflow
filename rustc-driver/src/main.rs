@@ -157,6 +157,10 @@ fn by_line(items: &[CrateItem], line: usize, col: Option<usize>, file: &Path) ->
     };
     match innermost.as_slice() {
         [item] => Ok(lift(*item)),
+        [] if !items.iter().any(|item| span_file(&item.span()) == file) => Err(format!(
+            "no code of {} is compiled in this package: the file is not in its module tree (no `mod` for it) or sits behind a cfg",
+            file.display()
+        )),
         [] => Err(format!("no local function or closure contains line {line} of {}", file.display())),
         many => {
             let names: Vec<String> = many.iter().map(|item| item.name()).collect();

@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from codeflow._cfg import ir_tidy  # noqa: E402
+from codeflow._cfg import _summarize, _wrap_label, ir_tidy  # noqa: E402
 
 
 def block(id, kind, label, succ, lines=None):
@@ -75,6 +75,42 @@ class BranchWithABodyAfterAMacroCondition(unittest.TestCase):
         self.assertIn("report", labels, "the if body is reachable")
         condition = next(b for b in tidy["blocks"] if b["kind"] == "switch" and {e["label"] for e in b["succ"]} == {"true", "false"})
         self.assertEqual(len(condition["succ"]), 2)
+
+
+class BlockLabels(unittest.TestCase):
+    def test_calls_keep_their_order_and_a_repeat_shows_its_count(self):
+        steps = ["call _print(..)", "call new_display(..)", "call _print(..)", "call _print(..)", "return"]
+        self.assertEqual(_summarize(steps), "calls _print, new_display, _print ×2 · return")
+
+    def test_no_call_is_cut(self):
+        steps = [f"call f{i}(..)" for i in range(30)]
+        label = _summarize(steps)
+        self.assertTrue(all(f"f{i}" in label for i in range(30)))
+        self.assertNotIn("…", label)
+
+    def test_a_long_label_wraps_between_calls(self):
+        label = _summarize([f"call <Vec<u32> as Trait>::method_{i}(..)" for i in range(12)]) + " · if cond"
+        lines = _wrap_label(label, width=60)
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all(len(line) <= 60 + 40 for line in lines))
+        joined = " ".join(lines).replace("· ", "").replace(", ", ",")
+        for i in range(12):
+            self.assertIn(f"method_{i}", joined)
+        self.assertTrue(lines[-1].lstrip("· ").startswith(("if cond", "calls")) or "if cond" in " ".join(lines))
+
+    def test_a_macros_diverging_call_sits_on_the_line_before_it(self):
+        graph = {
+            "file": "/nonexistent.rs",
+            "entry": 0,
+            "blocks": [
+                block(0, "switch", "switch on cond", [(1, "false"), (2, "true")], [7, 7]),
+                block(1, "call", "call panic_fmt(..)", []),
+                block(2, "return", "return", [], [8, 8]),
+            ],
+        }
+        tidy = ir_tidy(graph)
+        panic = next(b for b in tidy["blocks"] if "panic_fmt" in b["label"])
+        self.assertEqual(panic["lines"], [7, 7])
 
 
 if __name__ == "__main__":

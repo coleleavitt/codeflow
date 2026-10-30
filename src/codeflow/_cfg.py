@@ -336,6 +336,22 @@ def simplify(graph: dict, *, cleanup: bool = False) -> dict:
     return dict(graph, blocks=kept, names=names)
 
 
+def _wrap_label(label: str, width: int = 100) -> list[str]:
+    """A block's label on lines of about ``width`` columns, broken only between calls (after a comma) or at a ` · `."""
+    pieces = re.split(r"(?<=, )|(?= · )", label)
+    lines, current = [], ""
+    for piece in pieces:
+        if current and len(current) + len(piece) > width:
+            lines.append(current.rstrip())
+            current = piece.lstrip(" ·").lstrip() if piece.startswith(" · ") else piece
+            if piece.startswith(" · "):
+                current = "· " + current
+        else:
+            current += piece
+    lines.append(current.rstrip())
+    return lines
+
+
 def render(graph: dict, base: Path | None = None) -> str:
     file = graph["file"]
     if base is not None:
@@ -355,10 +371,13 @@ def render(graph: dict, base: Path | None = None) -> str:
         lines = block["lines"]
         where = (f":{lines[0]}" if lines[0] == lines[1] else f":{lines[0]}-{lines[1]}") if lines else ""
         label = block["label"] or ("exit" if block["kind"] == "exit" else "")
-        head = f"{name:<4}{where:<12}{label}"
+        wrapped = _wrap_label(label)
+        head = f"{name:<4}{where:<12}{wrapped[0]}"
         if len(preds.get(block["id"], [])) > 1:
-            head += f"    ← {', '.join(sorted(set(preds[block['id']]), key=lambda s: int(s[1:])))}"
+            wrapped[-1] += f"    ← {', '.join(sorted(set(preds[block['id']]), key=lambda s: int(s[1:])))}"
+            head = f"{name:<4}{where:<12}{wrapped[0]}"
         out.append(head.rstrip())
+        out.extend(f"{'':16}{line}".rstrip() for line in wrapped[1:])
         succ = block["succ"]
         for index, edge in enumerate(succ):
             target = names.get(edge["to"], "?")
@@ -417,6 +436,20 @@ def _postdominators(blocks: dict[int, dict], entry: int) -> dict[int, set[int]]:
             if new != pdom[n]:
                 pdom[n], changed = new, True
     return pdom
+
+
+def _line_before(blocks: dict[int, dict], preds: dict[int, list[int]], start: int) -> int | None:
+    """The last source line of the nearest block before ``start`` that has one."""
+    seen, todo = {start}, list(preds.get(start, []))
+    while todo:
+        n = todo.pop(0)
+        if n in seen or n not in blocks:
+            continue
+        seen.add(n)
+        if blocks[n]["lines"]:
+            return blocks[n]["lines"][1]
+        todo.extend(preds.get(n, []))
+    return None
 
 
 def _code_between(blocks: dict[int, dict], start: int, join: int) -> bool:
@@ -508,17 +541,10 @@ def ir_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dic
     for n in live:
         b = blocks[n]
         if b["kind"] == "switch" and b["lines"] is None and len(b["succ"]) > 1:
-            seen, todo = {n}, list(preds.get(n, []))
-            while todo:
-                m = todo.pop(0)
-                if m in seen:
-                    continue
-                seen.add(m)
-                if blocks[m]["lines"]:
-                    b["lines"] = [blocks[m]["lines"][1]] * 2
-                    b["macro_condition"] = True
-                    break
-                todo.extend(preds.get(m, []))
+            line = _line_before(blocks, preds, n)
+            if line:
+                b["lines"] = [line, line]
+                b["macro_condition"] = True
     # Branch labels from the source. Each MIR branch tests one operand (`a || b` is two branches),
     # and the driver gives that operand's span: the label names it. rustc lowers `!c` by branching
     # on `c` with the targets swapped, so an operand preceded by `!` gets its edges flipped back.
@@ -594,6 +620,18 @@ def ir_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dic
             b["kind"], b["succ"] = nxt["kind"], nxt["succ"]
         b["label"] = _summarize(steps[n])
     kept = [blocks[n] for n in _reachable(blocks, entry) if n not in merged_into]
+    # A macro's diverging call (`panic_fmt` of `assert!`, `unreachable!`) carries no line of its own: it sits
+    # on the line of the code before it.
+    kept_by_id = {b["id"]: b for b in kept}
+    kept_preds: dict[int, list[int]] = {}
+    for b in kept:
+        for e in b["succ"]:
+            kept_preds.setdefault(e["to"], []).append(b["id"])
+    for b in kept:
+        if b["lines"] is None and b["label"] and b["kind"] != "exit":
+            line = _line_before(kept_by_id, kept_preds, b["id"])
+            if line:
+                b["lines"] = [line, line]
     for b in kept:
         if b["kind"] == "assert" and b["label"].startswith("assert: `async fn` resumed"):
             b["kind"], b["succ"] = "raise", [{"to": -1, "label": "panic"}]
@@ -644,17 +682,21 @@ def _reachable(blocks: dict[int, dict], entry: int) -> list[int]:
 
 
 def _summarize(steps: list[str]) -> str:
-    calls, rest = [], []
+    """A merged block's steps: its calls in order (a call repeated back to back as `name ×N`), then the rest."""
+    calls: list[list] = []
+    rest = []
     for step in steps:
         if step.startswith("call "):
             name = step[5:].removesuffix("(..)")
-            if name not in calls:
-                calls.append(name)
+            if calls and calls[-1][0] == name:
+                calls[-1][1] += 1
+            else:
+                calls.append([name, 1])
         elif step not in ("return",):
             rest.append(step)
     parts = []
     if calls:
-        parts.append("calls " + ", ".join(calls[:6]) + (" …" if len(calls) > 6 else ""))
+        parts.append("calls " + ", ".join(name if count == 1 else f"{name} ×{count}" for name, count in calls))
     parts += rest
     if "return" in steps:
         parts.append("return")

@@ -76,6 +76,10 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
   `&&`/`||` operands are labelled the same way from the LLVM IR's columns (`[tests !ctx->no_alloc]`); operands inside a
   macro argument (`GGML_ASSERT(a && b)`) are labelled too: their instructions carry the spelled column (clang's
   `getMacroDebugLoc`), the branch itself the macro body's, so the operand start skips the branch.
+- Rust blocks: a merged block lists its calls in the order they run, a call repeated back to back as `name ×N`, and
+  never cuts the list; a long label wraps between calls. A macro's condition (`matches!` in `if a && matches!(..)`) is a
+  branch of its own when its paths lead to different code (`[tests the macro's condition]`), and a diverging macro call
+  (`assert!`'s `panic_fmt`, `unreachable!`) sits on the line of the code before it.
 - A line instead of a name picks the innermost function around it: a JS/TS anonymous callback is
   `outer::<arrow@L>`, a Rust closure `outer::{closure#0}`. Two Rust closures on one line: `"LINE:COL"` picks the one whose body holds
   that column (a bare line names both and asks for one).

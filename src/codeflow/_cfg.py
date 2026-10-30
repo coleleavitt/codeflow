@@ -375,10 +375,37 @@ _HIDDEN_CALLS = ("Pin::new_unchecked", "IntoFuture>::into_future", "{closure#", 
                  " as Deref>::deref(", " as DerefMut>::deref_mut(")
 
 
+def _back_edges(blocks: dict[int, dict], entry: int) -> set[tuple[int, int]]:
+    """The edges that close a loop (an edge to a block still on the depth-first path)."""
+    back: set[tuple[int, int]] = set()
+    state = {entry: 1}  # 1: on the path, 2: done
+    stack = [(entry, iter(blocks[entry]["succ"]))]
+    while stack:
+        n, edges = stack[-1]
+        for e in edges:
+            m = e["to"]
+            if m not in blocks:
+                continue
+            if state.get(m) == 1:
+                back.add((n, m))
+            elif m not in state:
+                state[m] = 1
+                stack.append((m, iter(blocks[m]["succ"])))
+                break
+        else:
+            state[n] = 2
+            stack.pop()
+    return back
+
+
 def _postdominators(blocks: dict[int, dict], entry: int) -> dict[int, set[int]]:
-    """Each block's post-dominators (blocks every path from it to an exit passes through)."""
+    """Each block's post-dominators (blocks every path from it to an exit passes through), leaving out the
+    edges that close a loop: a `continue` and the loop body only meet again at the loop head, which is
+    where a branch's paths join only if the branch has no code of its own after it."""
+    back = _back_edges(blocks, entry)
+    forward = {n: [e["to"] for e in blocks[n]["succ"] if e["to"] in blocks and (n, e["to"]) not in back] for n in blocks}
     nodes = list(blocks)
-    exits = {n for n in nodes if not blocks[n]["succ"]}
+    exits = {n for n in nodes if not forward[n]}
     pdom = {n: ({n} if n in exits else set(nodes)) for n in nodes}
     changed = True
     while changed:
@@ -386,11 +413,24 @@ def _postdominators(blocks: dict[int, dict], entry: int) -> dict[int, set[int]]:
         for n in nodes:
             if n in exits:
                 continue
-            succ = [e["to"] for e in blocks[n]["succ"] if e["to"] in blocks]
-            new = {n} | (set.intersection(*(pdom[s] for s in succ)) if succ else set())
+            new = {n} | set.intersection(*(pdom[s] for s in forward[n]))
             if new != pdom[n]:
                 pdom[n], changed = new, True
     return pdom
+
+
+def _code_between(blocks: dict[int, dict], start: int, join: int) -> bool:
+    """Whether a block with a source line lies on a path from ``start`` to ``join`` (``join`` itself aside)."""
+    seen, todo = {start, join}, [e["to"] for e in blocks[start]["succ"]]
+    while todo:
+        n = todo.pop()
+        if n in seen or n not in blocks:
+            continue
+        seen.add(n)
+        if blocks[n]["lines"]:
+            return True
+        todo.extend(e["to"] for e in blocks[n]["succ"])
+    return False
 
 
 def ir_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dict:
@@ -449,12 +489,36 @@ def ir_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dic
     live = _reachable(blocks, entry)
     sub = {n: blocks[n] for n in live}
     pdom = _postdominators(sub, entry)
+    back = _back_edges(sub, entry)
+    for n in live:
+        b = blocks[n]
+        # A branch with a way back to the loop head (a `continue`) is control flow, not a macro's internals.
+        if b["kind"] == "switch" and b["lines"] is None and len(b["succ"]) > 1 and not any((n, e["to"]) in back for e in b["succ"]):
+            joins = sorted(pdom[n] - {n}, key=lambda m: len(pdom[m]), reverse=True)
+            # Code of its own between the branch and its join (`if !matches!(..) { call() }`) is no macro internal.
+            if joins and not _code_between(blocks, n, joins[0]):
+                b["kind"], b["label"], b["succ"] = "goto", "", [{"to": joins[0], "label": ""}]
+    # A branch with no source line whose paths never meet again (a macro's condition, like the `matches!`
+    # in `if a && matches!(..) { continue }`) leads to different real code: keep it, under the line it follows.
+    live = _reachable(blocks, entry)
+    preds: dict[int, list[int]] = {}
+    for n in live:
+        for e in blocks[n]["succ"]:
+            preds.setdefault(e["to"], []).append(n)
     for n in live:
         b = blocks[n]
         if b["kind"] == "switch" and b["lines"] is None and len(b["succ"]) > 1:
-            joins = sorted(pdom[n] - {n}, key=lambda m: len(pdom[m]), reverse=True)
-            if joins:
-                b["kind"], b["label"], b["succ"] = "goto", "", [{"to": joins[0], "label": ""}]
+            seen, todo = {n}, list(preds.get(n, []))
+            while todo:
+                m = todo.pop(0)
+                if m in seen:
+                    continue
+                seen.add(m)
+                if blocks[m]["lines"]:
+                    b["lines"] = [blocks[m]["lines"][1]] * 2
+                    b["macro_condition"] = True
+                    break
+                todo.extend(preds.get(m, []))
     # Branch labels from the source. Each MIR branch tests one operand (`a || b` is two branches),
     # and the driver gives that operand's span: the label names it. rustc lowers `!c` by branching
     # on `c` with the targets swapped, so an operand preceded by `!` gets its edges flipped back.
@@ -481,6 +545,8 @@ def ir_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dic
                 e["label"] = "true" if e["label"] == "false" else "false"
         shown = line if len(line) <= 70 else line[:69] + "…"
         b["label"] = shown if not tested or tested.strip() == condition.strip() else f"{shown}   [tests {tested}]"
+        if b.get("macro_condition"):
+            b["label"] = f"{shown}   [tests the macro's condition]"
     if not graph.get("negation_folded", True):
         # LLVM IR: each `&&`/`||` operand is its own branch, starting at the leftmost column of its
         # block's instructions on that line; it runs to the next operator at its depth.

@@ -50,6 +50,12 @@ fn main() {
     };
     let file = std::env::var("CODEFLOW_FILE").ok().map(|f| canonical(Path::new(&f)));
     let out = std::env::var("CODEFLOW_OUT").expect("CODEFLOW_OUT is not set");
+    // Trimmed names are what this driver prints. rustc panics when its diagnostic context is dropped
+    // after `trimmed_def_paths` ran without any diagnostic printed (`Session::record_trimmed_def_paths`),
+    // which a function whose callees print a type needing a trimmed path (`Zeroizing<String>`) triggers.
+    // A set `RUSTC_LOG` skips that check.
+    // SAFETY: nothing else runs yet; rustc starts its threads inside `run!`.
+    unsafe { std::env::set_var("RUSTC_LOG", "off") };
     let result = run!(&args[1..], || -> ControlFlow<Result<Value, String>> {
         ControlFlow::Break(dump(&query, file.as_deref()))
     });

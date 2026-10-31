@@ -391,7 +391,10 @@ def render(graph: dict, base: Path | None = None) -> str:
 
 # Calls the source never spells out: await plumbing, format_args internals, auto-deref.
 _HIDDEN_CALLS = ("Pin::new_unchecked", "IntoFuture>::into_future", "{closure#", "Arguments::", "must_use(",
-                 " as Deref>::deref(", " as DerefMut>::deref_mut(")
+                 " as Deref>::deref(", " as DerefMut>::deref_mut(",
+                 # `tracing`'s level gate in `info!("...")`: with no format arguments nothing else of the
+                 # macro has a source line, so the gate alone would stay behind as a call of the code around it.
+                 "<Level as PartialOrd<LevelFilter>>::", "LevelFilter::current(")
 
 
 def _back_edges(blocks: dict[int, dict], entry: int) -> set[tuple[int, int]]:
@@ -452,15 +455,25 @@ def _line_before(blocks: dict[int, dict], preds: dict[int, list[int]], start: in
     return None
 
 
-def _code_between(blocks: dict[int, dict], start: int, join: int) -> bool:
-    """Whether a block with a source line lies on a path from ``start`` to ``join`` (``join`` itself aside)."""
+def _closing_braces_only(block: dict, source: list[str]) -> bool:
+    """Whether the block's source lines are all closing braces (`}`, `});`): the end of a scope, where rustc
+    drops what it still owns and branches on a drop flag."""
+    lines = block["lines"]
+    if not lines or not source or lines[1] > len(source):
+        return False
+    return all(source[row - 1].strip() and set(source[row - 1].strip()) <= set("});,") for row in range(lines[0], lines[1] + 1))
+
+
+def _code_between(blocks: dict[int, dict], start: int, join: int, source: list[str] | None = None) -> bool:
+    """Whether a block with a source line lies on a path from ``start`` to ``join`` (``join`` itself aside).
+    With ``source``, a block that only sits on a closing brace is no code."""
     seen, todo = {start, join}, [e["to"] for e in blocks[start]["succ"]]
     while todo:
         n = todo.pop()
         if n in seen or n not in blocks:
             continue
         seen.add(n)
-        if blocks[n]["lines"]:
+        if blocks[n]["lines"] and not (source and _closing_braces_only(blocks[n], source)):
             return True
         todo.extend(e["to"] for e in blocks[n]["succ"])
     return False
@@ -526,10 +539,12 @@ def ir_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dic
     for n in live:
         b = blocks[n]
         # A branch with a way back to the loop head (a `continue`) is control flow, not a macro's internals.
-        if b["kind"] == "switch" and b["lines"] is None and len(b["succ"]) > 1 and not any((n, e["to"]) in back for e in b["succ"]):
+        # (A drop-flag branch at the end of a scope sits on its closing brace: it is no source branch either.)
+        macro_internal = b["lines"] is None or (b["label"].startswith("switch") and _closing_braces_only(b, source))
+        if b["kind"] == "switch" and macro_internal and len(b["succ"]) > 1 and not any((n, e["to"]) in back for e in b["succ"]):
             joins = sorted(pdom[n] - {n}, key=lambda m: len(pdom[m]), reverse=True)
             # Code of its own between the branch and its join (`if !matches!(..) { call() }`) is no macro internal.
-            if joins and not _code_between(blocks, n, joins[0]):
+            if joins and not _code_between(blocks, n, joins[0], source):
                 b["kind"], b["label"], b["succ"] = "goto", "", [{"to": joins[0], "label": ""}]
     # A branch with no source line whose paths never meet again (a macro's condition, like the `matches!`
     # in `if a && matches!(..) { continue }`) leads to different real code: keep it, under the line it follows.

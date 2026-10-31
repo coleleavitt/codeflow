@@ -25,6 +25,9 @@ from pathlib import Path
 
 __all__ = ["FlowGraph", "FlowTree", "cfg", "tree"]
 
+# The language servers index the workspace the session started in: this module is imported with the kernel.
+_SESSION_ROOT = Path.cwd().resolve()
+
 _JS = {".js", ".mjs", ".cjs"}
 _TS = {".ts", ".tsx", ".mts", ".cts"}
 _C = {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"}
@@ -421,6 +424,19 @@ def _root(file: Path, root: str | os.PathLike[str] | None) -> Path:
         return file.parent
 
 
+def _outside_workspace_hint(file: Path, session_root: Path | None = None) -> str:
+    """Why a lookup in ``file`` may never succeed: a language server only knows the workspace the session
+    started in (and what that workspace depends on), so a project elsewhere is not indexed at all."""
+    root = session_root or _SESSION_ROOT
+    if file.is_relative_to(root):
+        return ""
+    return (
+        f"\nThis file is outside the language server's workspace ({root}), which it indexes together with that "
+        "workspace's own dependencies: another project is never indexed however long it waits. Start the session "
+        "in that project, or for Rust use cfg(file, name, follow=N): it builds the crate with the compiler."
+    )
+
+
 _DEF = r"\b(?:fn|def|class|struct|enum|trait|impl|function)\s+{name}\b"
 _CALL = r"\b{name}\s*\("
 # A fresh server returns no call hierarchy until it has indexed the workspace
@@ -481,6 +497,7 @@ async def _lsp_tree(file: Path, at: str | int, direction: str, depth: int, root:
     if not prepared.items:
         raise LookupError(
             f"{file}:{line}:{col}: {prepared.text} (after waiting {_INDEX_WAIT_SECONDS}s for the server to index)"
+            + _outside_workspace_hint(file)
         )
     top = prepared.items[0]
     edges: list[tuple[str, str, str]] = []

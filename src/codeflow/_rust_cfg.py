@@ -56,6 +56,20 @@ def _target(file: pathlib.Path, package_dir: pathlib.Path, package: str) -> list
     return ["--lib"]
 
 
+def _rust_checkout_env(workspace: pathlib.Path) -> dict[str, str]:
+    """The environment bootstrap (`./x`) gives the compiler crates, for a workspace that is a
+    rust-lang/rust checkout: their sources read these with `env!`, and their build scripts refuse
+    to run outside bootstrap unless `RUSTC_BOOTSTRAP` is set. Empty for any other workspace."""
+    if not (workspace / "x.py").exists() or not (workspace / "src" / "bootstrap").is_dir():
+        return {}
+    return {
+        "RUSTC_BOOTSTRAP": "1",
+        "CFG_RELEASE": (workspace / "src" / "version").read_text().strip(),
+        "CFG_RELEASE_CHANNEL": (workspace / "src" / "ci" / "channel").read_text().strip(),
+        "RUSTC_INSTALL_BINDIR": "bin",
+    }
+
+
 def rust_cfg(file: pathlib.Path, function: str | int) -> dict:
     """The MIR control-flow graph of `function` defined in `file`: a name or path suffix (closures as
     `outer::{closure#0}`), or a 1-based line, which picks the innermost fn, closure or async block around it."""
@@ -74,7 +88,7 @@ def rust_cfg(file: pathlib.Path, function: str | int) -> dict:
             "CODEFLOW_FILE": str(file),
             "CODEFLOW_OUT": str(out),
             "CARGO_TARGET_DIR": str(workspace / "target" / "codeflow"),
-        }
+        } | _rust_checkout_env(workspace)
         cmd = ["cargo", TOOLCHAIN, "rustc", "-p", package, *_target(file, package_dir, package), "--profile", "check"]
         _run([*cmd, "--", "--cfg", f"codeflow_probe_{uuid.uuid4().hex[:12]}"], workspace, env)
         if not out.exists():

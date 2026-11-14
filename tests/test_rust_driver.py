@@ -43,5 +43,31 @@ class DriverDoesNotCrashRustc(unittest.TestCase):
         self.assertIn("map_err", calls)
 
 
+@unittest.skipUnless(have_driver_toolchain(), f"needs the {TOOLCHAIN} toolchain")
+class RustCheckoutCompilerCrates(unittest.TestCase):
+    def test_a_compiler_crate_builds_without_bootstrap(self):
+        """A crate in a rust-lang/rust checkout: its build script refuses to run outside bootstrap
+        (like `rustc_macros`) and its source reads bootstrap's `env!("CFG_RELEASE")` (like `rustc_span`)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "x.py").write_text("")
+            (root / "src" / "bootstrap").mkdir(parents=True)
+            (root / "src" / "ci").mkdir()
+            (root / "src" / "version").write_text("1.102.0\n")
+            (root / "src" / "ci" / "channel").write_text("nightly\n")
+            (root / "Cargo.toml").write_text('[workspace]\nmembers = ["compiler/rustc_fx"]\nresolver = "2"\n')
+            krate = root / "compiler" / "rustc_fx"
+            (krate / "src").mkdir(parents=True)
+            (krate / "Cargo.toml").write_text('[package]\nname = "rustc_fx"\nversion = "0.0.0"\nedition = "2024"\n')
+            (krate / "build.rs").write_text(
+                'fn main() {\n    assert!(std::env::var_os("RUSTC_BOOTSTRAP").is_some(), "wrong command used for building");\n}\n'
+            )
+            (krate / "src" / "lib.rs").write_text(
+                'pub fn release(n: u32) -> &\'static str {\n    if n > 0 { env!("CFG_RELEASE") } else { env!("CFG_RELEASE_CHANNEL") }\n}\n'
+            )
+            graph = rust_cfg(krate / "src" / "lib.rs", "release")
+        self.assertGreater(len(graph["blocks"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

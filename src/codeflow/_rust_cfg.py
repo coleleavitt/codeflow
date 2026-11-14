@@ -49,7 +49,9 @@ def _target(file: pathlib.Path, package_dir: pathlib.Path, package: str) -> list
     rel = file.relative_to(package_dir).parts
     if rel[:2] == ("src", "bin"):
         return ["--bin", rel[2].removesuffix(".rs")]
-    if file.name == "main.rs":
+    manifest = tomllib.loads((package_dir / "Cargo.toml").read_text())
+    has_lib = "lib" in manifest or (package_dir / "src" / "lib.rs").exists()
+    if file.name == "main.rs" or not has_lib:
         return ["--bin", package]
     return ["--lib"]
 

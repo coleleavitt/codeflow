@@ -1,6 +1,6 @@
 ---
 name: codeflow
-description: "Call trees and per-function control-flow graphs from the code's real structure, rendered with file:line: who calls a function, what it calls, and every path through it (branches, loops, early returns, raises, never-returning calls). Use it instead of grep for control flow, callers, callees, what links to what, or how a feature is wired. codeflow.tree uses the session's language servers (Rust, Python, C/C++, TypeScript/JavaScript, Go, Dart, Java, C#, Swift) and acorn for JS bundles; codeflow.cfg uses Python ast, acorn (JS/TS), LLVM IR with the project's compile flags (C/C++) and rustc MIR via rustc_public (Rust), by function name or by line, with follow=N to nest callee graphs."
+description: "Call trees and per-function control-flow graphs from the code's real structure, rendered with file:line: who calls a function, what it calls, and every path through it (branches, loops, early returns, raises, never-returning calls). Use it instead of grep for control flow, callers, callees, what links to what, or how a feature is wired. codeflow.tree uses the session's language servers (Rust, Python, C/C++, TypeScript/JavaScript, Go, Dart, Java, C#, Swift) and acorn for JS bundles; codeflow.cfg uses Python ast, acorn (JS/TS), LLVM IR with the project's compile flags (C/C++) and rustc MIR via rustc_public (Rust), by function name or by line, with follow=N to nest callee graphs. Triggers: codeflow, cfg, mir, acorn, ast walk, codegraph, call graph, call tree, callers, callees, control flow, \"dig in\" on code structure."
 ---
 
 # codeflow
@@ -40,6 +40,7 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
 |---|---|
 | What does X call / who calls X / how is a feature wired | `codeflow.tree` |
 | Every path through X: branches, early returns, loops, error paths | `codeflow.cfg` |
+| Which recursion in a Rust crate is not bounded by a guard (stack-depth checks) | `codeflow.recursion(file, ["check_stack"], release=False)` |
 | Where is X defined, its type or signature | `rlm.lsp.definition`, `rlm.lsp.hover` |
 | Every use of X | `rlm.lsp.references` |
 | A file's outline | `rlm.lsp.document_symbols` |
@@ -49,6 +50,12 @@ graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds u
 
 ## Limits
 
+- `codeflow.recursion` works on the crate's LLVM IR (`cargo rustc --emit=llvm-ir`, one codegen unit, line
+  tables), so it sees every monomorphized instance, inlining in `release=True`, and calls through function
+  pointers and `dyn` (sent to every address-taken function of the crate with the same LLVM type, so it can report
+  cycles that cannot happen). A path is guarded once it runs a guard: a call to one, code inlined from one (by
+  debug locations), or a call to a function that runs a guard before its first branch. Code in other crates that
+  is not instantiated here is not seen; it can only reach this crate through an address-taken function.
 - Syntax and server facts only: dynamic dispatch, callbacks stored in data, and macros may be missing; say so when
   a conclusion depends on them. The JS walker resolves top-level functions and `this.` methods of the same class;
   `obj.method()` on other objects is left out.

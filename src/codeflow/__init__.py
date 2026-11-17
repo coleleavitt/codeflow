@@ -23,7 +23,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__all__ = ["FlowGraph", "FlowTree", "cfg", "tree"]
+__all__ = ["FlowGraph", "FlowTree", "cfg", "recursion", "tree"]
 
 # The language servers index the workspace the session started in: this module is imported with the kernel.
 _SESSION_ROOT = Path.cwd().resolve()
@@ -51,6 +51,23 @@ class FlowTree:
         return self.text
 
     __str__ = __repr__
+
+
+async def recursion(
+    file: str | os.PathLike[str],
+    guards: tuple[str, ...] | list[str] = (),
+    *,
+    release: bool = False,
+):
+    """Recursive cycles in the Rust crate of ``file`` that some call path goes around without
+    passing one of ``guards`` (function names, e.g. ``"check_stack"``), from the crate's LLVM IR.
+
+    Each cycle prints with one witness call per step, as ``file:line``. ``release=True`` checks the
+    optimized build, where guards inlined into their callers are found by debug locations.
+    Indirect calls go to every address-taken function of the same LLVM type."""
+    from ._ir_recursion import recursion as _recursion
+
+    return await asyncio.to_thread(_recursion, Path(file), tuple(guards), release=release)
 
 
 async def tree(

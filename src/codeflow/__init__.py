@@ -211,18 +211,24 @@ async def cfg(
         # Not a function (a field, a constant, a type): its references are the answer.
         why = str(error).splitlines()[0][:160]
         return FlowGraph(str(function), f"{refs_text}\n\n(no control-flow graph: {why})", {})
+    # A line inside a Rust closure means the function it is written in (closures have no symbol in the index,
+    # and a line is the user's way to name a function); the closure's own graph follows as its own section.
+    closure = None
+    outer = _enclosing_named(str(graph["function"])) if file.suffix == ".rs" and isinstance(function, int | str) and _by_line(function) else None
+    if outer is not None:
+        try:
+            closure, graph = graph, await _build(file, outer, level, cleanup)
+        except (LookupError, RuntimeError):
+            closure = None  # the enclosing function does not build: the closure is the answer
     simple = _cfg.simplify(graph, cleanup=cleanup)
     base = _root(file, root)
     notes, tail = await _annotations(file, simple, var, dominators)
     result = FlowGraph(str(graph["function"]), _cfg.render(simple, base, notes) + tail, simple)
-    outer = _enclosing_named(str(graph["function"])) if file.suffix == ".rs" else None
-    if outer is not None:
-        # A line inside a closure: the closure's graph, then the whole graph of the function it is written in.
-        whole = _cfg.simplify(await _build(file, outer, level, cleanup), cleanup=cleanup)
-        notes_whole, tail_whole = await _annotations(file, whole, var, dominators)
-        header = f"{outer}  (the function around the closure)"
-        result.text = f"{_cfg.render(whole, base, notes_whole) + tail_whole}\n\n{result.text}"
-        result.text = f"{header}\n{result.text}"
+    if closure is not None:
+        closure_simple = _cfg.simplify(closure, cleanup=cleanup)
+        closure_notes, closure_tail = await _annotations(file, closure_simple, var, dominators)
+        section = f"{closure['function']}  (the closure at line {closure['line']}, inside {graph['function']})"
+        result.text += f"\n\n{section}\n{_cfg.render(closure_simple, base, closure_notes) + closure_tail}"
     if note:
         result.text = f"note: {note}\n{result.text}"
     if refs_text is not None:
@@ -972,6 +978,11 @@ def _scip_note(error: Exception) -> None:
     import sys
 
     print(f"codeflow: SCIP index unavailable ({str(error).splitlines()[0][:200]}); using the language server", file=sys.stderr)
+
+
+def _by_line(function: str | int) -> bool:
+    """Whether the function was named by a line (``430`` or ``430:12``), not by a name."""
+    return isinstance(function, int) or bool(re.fullmatch(r"\d+(:\d+)?", str(function)))
 
 
 def _enclosing_named(function: str) -> str | None:

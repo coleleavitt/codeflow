@@ -1,52 +1,100 @@
 ---
 name: codeflow
-description: "Call trees and per-function control-flow graphs from the code's real structure, rendered with file:line: who calls a function, what it calls, and every path through it (branches, loops, early returns, raises, never-returning calls). Use it instead of grep for control flow, callers, callees, what links to what, or how a feature is wired. codeflow.tree uses the session's language servers (Rust, Python, C/C++, TypeScript/JavaScript, Go, Dart, Java, C#, Swift) and acorn for JS bundles; codeflow.cfg uses Python ast, acorn (JS/TS), LLVM IR with the project's compile flags (C/C++) and rustc MIR via rustc_public (Rust), by function name or by line, with follow=N to nest callee graphs. Triggers: codeflow, cfg, mir, acorn, ast walk, codegraph, call graph, call tree, callers, callees, control flow, \"dig in\" on code structure."
+description: "One tool, codeflow.cfg: every path through a function (branches, loops, early returns, raises, never-returning calls), who calls it (callers=N), what it calls (callees=N, follow=N), where a value comes from (var=, def-use with reaching definitions), every reference to a symbol by kind (refs=True: call, write, read, reference taken, type use; fields and constants too) and dominators, rendered with file:line from the code's real structure. Use it instead of grep for control flow, callers, callees, what links to what, or how a feature is wired. Callers and callees use the session's language servers (Rust, Python, C/C++, TypeScript/JavaScript, Go, Dart, Java, C#, Swift) and acorn for JS bundles; codeflow.cfg uses Python ast, acorn (JS/TS), LLVM IR with the project's compile flags (C/C++) and rustc MIR via rustc_public (Rust), by function name or by line, with follow=N to nest callee graphs. Triggers: codeflow, cfg, mir, acorn, ast walk, call graph, call tree, callers, callees, control flow, \"dig in\" on code structure."
 ---
 
 # codeflow
 
+One tool, `codeflow.cfg`: every path through a function, who calls it and what it calls, where a value comes from,
+and every reference to any symbol, with file:line.
+
 ```python
-print(await codeflow.tree("crates/pa-tui/src/session_ui/queue.rs", "send_now"))            # what it calls
-print(await codeflow.tree("src/server.py", "handle", direction="incoming", depth=2))      # who calls it
-print(await codeflow.tree("chunk.deob.js", "$9t.sendQueuedNow", depth=4))                 # a JS bundle
-print(await codeflow.cfg("src/rlm/repl.py", "_run_guarded"))                              # every path through one function
-print(await codeflow.cfg("ggml/src/ggml.c", 1778))                                        # the function around a line
-print(await codeflow.cfg("src/server.py", "handle", follow=1))                            # plus each project callee's graph
+print(await codeflow.cfg("crates/pa-tui/src/session_ui/queue.rs", "send_now"))                # every path through it
+print(await codeflow.cfg("src/server.py", "handle", callers=2))                                # + who calls it, 2 levels
+print(await codeflow.cfg("src/server.py", "handle", callees=1))                                # + what it calls
+print(await codeflow.cfg("src/server.py", "handle", follow=1))                                 # + each project callee's graph
+print(await codeflow.cfg("ggml/src/ggml.c", 1778))                                             # the function around a line
+print(await codeflow.cfg("crates/x/src/lib.rs", "Runner::run_cycle"))                          # Type::method, Trait::method
+print(await codeflow.cfg("src/server.py", "handle", var="total"))                              # where `total` comes from at each read
+print(await codeflow.cfg("crates/x/src/lib.rs", "limit", refs=True))                           # every site naming it, by kind (a field too)
+print(await codeflow.cfg("src/server.py", "handle", dominators=True))                          # what every path to each block runs first
 ```
 
-`cfg(path, function_or_line, *, level="source", cleanup=False, follow=0, follow_limit=20)` (.py, .js/.mjs/.cjs, .ts/.tsx/.mts/.cts, .c/.h/.cc/.cpp, .rs)
-prints one line per block: `B3  :1081  if <condition>` with its edges
-(`true → B4`, `loop`, `done`, `exception`, `return`, `then re-raise`, `case X`, `goto L`; `↺` a loop back-edge,
-`← B1, B2` where paths join). Python `finally`, JS `finally`, C `goto`/`switch` fall-through and C++ `try` are
-modelled. Rust graphs come from the compiler's MIR (`?`, match arms and drops are real blocks; calls resolve to the
-concrete impl); the first call per workspace compiles it in `target/codeflow` (minutes), later calls only the crate
-(10-60 s on prime-agent). Rust `level`: `"source"` reads like the code; `"async"` adds the async state machine (state
-dispatch, `resume #k` edges, each `.await`'s Ready/Pending with the suspend to the executor); `"mir"` is the compiler's
-graph untouched (drops, macro internals, MIR temporaries). `cleanup=True` adds unwind paths at any level.
+`cfg(path, function_or_line, *, callers=0, callees=0, follow=0, follow_limit=20, level="source", cleanup=False)`
+(.py, .js/.mjs/.cjs, .ts/.tsx/.mts/.cts, .c/.h/.cc/.cpp, .rs) prints one line per block: `B3  :1081  if <condition>`
+with its edges (`true → B4`, `loop`, `done`, `exception`, `return`, `? returns the error`, `case X`, `goto L`; `↺` a
+loop back-edge, `← B1, B2` where paths join).
 
-- `at`: a symbol name (`"Class.method"` / `"Class.#private"` in JS), a 1-based line, or `"line:col"`.
-- `direction`: `"outgoing"` (default) or `"incoming"`. `depth`: levels (default 3).
-- LSP trees expand only functions under `root` (default: the file's git root); `external=True` lists calls into
-  dependencies and std as one leaf line.
-- JavaScript in a project (a `package.json`/`tsconfig.json`/`jsconfig.json` up to its git root, under 400 KB) goes
-  through the TypeScript server, which resolves `obj.method()` by type; bundles and loose files through acorn;
-  `backend="lsp"|"acorn"` forces one (an LSP failure falls back to acorn).
-- The result prints as a tree (`name  path:line  (at <call lines>)`, `↺` a cycle, `(expanded above)` a repeat);
-  `.edges` is `[(caller, callee, "path:line"), ...]`.
+- `callers=N`: who calls it, N levels, each call site as file:line, printed above the graph. `callees=N`: what it
+  calls, N levels, below it. Both come from the language servers (acorn for JS bundles); a lookup that finds nothing
+  says so in one line and the graph still prints.
+- `follow=N`: each project callee's own graph, nested (`── calls name  path:line (at lines)`), N levels, each
+  function once, at most `follow_limit` per function.
+- A name not defined in `path` is looked up in the project: one definition elsewhere is used (the header's `note:`
+  says where), several are listed with file:line.
+- Rust graphs come from the compiler's MIR (`?`, match arms and drops are real blocks; calls resolve to the concrete
+  impl); the first call per workspace compiles it in `target/codeflow` (minutes), later calls only the crate (10-60 s).
+  A crate that does not build, or a function the build leaves out (a `#[cfg(test)]` module), gets a syntax graph
+  from tree-sitter instead; its header says `syntax only` and why. Rust `level`: `"source"` reads like the code;
+  `"async"` adds the async state machine; `"mir"` is the compiler's graph untouched. `cleanup=True` adds unwind paths.
+- `var="x"` (or `"self.x"`): under each block, `def x :L` and `use x :L ← :L1, :L3`, the definitions that can reach
+  that read along the graph's paths (reaching definitions). A read nothing in the function reaches is a value from
+  outside (a parameter's caller, a field, a global), named in the closing line. What changes a variable without
+  assigning it counts as a definition too: a call it is passed to as `&mut` or `&x` (an out-parameter), a mutating
+  method (`v.push(x)`, `acc.append(x)`), a field or element write (`x.a = ..`, `x[i] = ..`), and a write through a
+  pointer to it, wherever the pointer is kept: a variable (`let r = &mut x; *r += 1`, C `int *p = &x; *p = 1`), a
+  struct field (`h = H { p: &raw mut x }; *h.p = 1`), or a struct handed to a call (`poke(&mut h)`). Rust reads the
+  compiler's MIR (each event in its exact block); `var` can be a field path there (`self.limit`: a write to
+  `self.limit`, to a part of it, or to all of `self` counts). Python reads `ast`; JS/TS, C and Rust that does not
+  build read the syntax with the same rules.
+- `refs=True`: every site that names the symbol across the project, grouped by what it does there: definition, call,
+  write (an assignment, a field initializer), read, reference taken (`&x`, a function stored or passed as a value),
+  type use, import; each with the function it sits in. It works for things with no graph (a struct field, a
+  constant, a type): then the references are the whole answer. Sites come from the language server when one
+  answers, else from a whole-word search of the project's files of that language.
+- `dominators=True`: under each block, `dominated by B3 ← B1 ← B0`: the blocks every path from the entry runs before
+  it (Cooper, Harvey and Kennedy's iterative algorithm).
+- An ambiguous name lists each definition (`A::dup (line 9), B::dup (line 10)`): pass the qualified name or a line.
+
+`codeflow.tree(path, at, direction="outgoing"|"incoming", depth=3)` is the same call tree as `callers=`/`callees=`
+without the graph; old cells keep working. `.edges` is `[(caller, callee, "path:line"), ...]`. `root` (default: the
+file's git root) bounds what counts as the project; `external=True` lists calls into dependencies as one leaf line.
 
 ## Which tool for which question
 
 | Question | Use |
 |---|---|
-| What does X call / who calls X / how is a feature wired | `codeflow.tree` |
-| Every path through X: branches, early returns, loops, error paths | `codeflow.cfg` |
+| Who calls X | `codeflow.cfg(file, "X", callers=2)` |
+| What X calls, how a feature is wired | `codeflow.cfg(file, "X", callees=2)`, or `follow=1` for their paths too |
+| Every path through X: branches, early returns, loops, error paths | `codeflow.cfg(file, "X")` |
 | Which recursion in a Rust crate is not bounded by a guard (stack-depth checks) | `codeflow.recursion(file, ["check_stack"], release=False)` |
+| Where a value comes from, every place it is set and read | `codeflow.cfg(file, "fn", var="x")` |
+| Every use of X (a function, field, constant, type), what each does | `codeflow.cfg(file, "X", refs=True)` |
+| What must run before a block | `codeflow.cfg(file, "fn", dominators=True)` |
 | Where is X defined, its type or signature | `rlm.lsp.definition`, `rlm.lsp.hover` |
-| Every use of X | `rlm.lsp.references` |
 | A file's outline | `rlm.lsp.document_symbols` |
-| Guards, every-path checks, C cleanup paths, tree-sitter queries | the `ast-walk` skill (`refs.py`, `guards.py`, `paths.py`) |
-| A minified bundle | deobfuscate first (`jsbeautify -d`, the `jsbeautify` skill), then `codeflow.tree` on the output |
+| A minified bundle | deobfuscate first (`jsbeautify -d`, the `jsbeautify` skill), then `codeflow.cfg` on the output |
 | A string, a log message, a config key | grep is right |
+
+## Outside the kernel: CLI and MCP
+
+The same tool runs without prime-agent (Claude Code, a shell). Language-server lookups then go through
+`_lsp_client`, which starts the servers named in `~/.prime/agent/settings.json`'s `lspServers` (or
+`$CODEFLOW_LSP_SETTINGS`; else rust-analyzer, pyright, clangd, typescript-language-server, gopls on `PATH`),
+rooted at each file's git root, in place of `rlm.lsp`.
+
+```sh
+codeflow cfg src/server.py handle --callers 2 --var total     # cfg's keywords as flags; --json for {function, text, graph}
+codeflow cfg Runner::run_cycle --callees 1                     # a bare name: its one definition in the project (cwd's git root, or --root)
+codeflow mcp                                                   # stdio MCP server: codeflow_cfg, codeflow_callers, codeflow_callees
+```
+
+Run it as `uv run --project ~/.prime/agent/skills/codeflow codeflow ...`, `python -m codeflow ...`, or the venv's
+`.venv/bin/codeflow`. Flags: `--function NAME` (or a second positional: a name, a line, `LINE:COL`), `--callers N`,
+`--callees N`, `--follow N`, `--follow-limit N`, `--var NAME`, `--refs`, `--dominators`, `--level`, `--cleanup`,
+`--root DIR`, `--json`. Claude Code registration (user scope):
+`claude mcp add --scope user codeflow -- ~/.prime/agent/skills/codeflow/.venv/bin/codeflow mcp`. The MCP server keeps
+its language servers up between calls; one CLI call starts and stops them.
 
 ## Limits
 

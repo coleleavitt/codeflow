@@ -5,6 +5,9 @@ description = "Call trees from language servers (rlm.lsp) and acorn, rendered wi
 requires-python = ">=3.10"
 dependencies = []
 
+[project.scripts]
+codeflow = "codeflow.cli:main"
+
 [build-system]
 requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"

@@ -352,7 +352,8 @@ def _wrap_label(label: str, width: int = 100) -> list[str]:
     return lines
 
 
-def render(graph: dict, base: Path | None = None) -> str:
+def render(graph: dict, base: Path | None = None, notes: dict[int, list[str]] | None = None) -> str:
+    """The graph as text; ``notes`` adds lines under a block (by block id): def-use marks, dominators."""
     file = graph["file"]
     if base is not None:
         try:
@@ -378,6 +379,7 @@ def render(graph: dict, base: Path | None = None) -> str:
             head = f"{name:<4}{where:<12}{wrapped[0]}"
         out.append(head.rstrip())
         out.extend(f"{'':16}{line}".rstrip() for line in wrapped[1:])
+        out.extend(f"{'':16}· {note}" for note in (notes or {}).get(block["id"], []))
         succ = block["succ"]
         for index, edge in enumerate(succ):
             target = names.get(edge["to"], "?")
@@ -652,6 +654,13 @@ def ir_tidy(graph: dict, *, cleanup: bool = False, level: str = "source") -> dic
             b["kind"], b["succ"] = "raise", [{"to": -1, "label": "panic"}]
             b["label"] = "panic: " + b["label"].removeprefix("assert: ")
     exit_block = {"id": -1, "lines": None, "kind": "exit", "label": "exit", "succ": [], "cleanup": False}
+    # Where each merged-away block went (the def-use marks place the driver's events by block).
+    merged = dict(graph.get("merged_into") or {})
+    for gone, into in merged_into.items():
+        while into in merged_into:
+            into = merged_into[into]
+        merged[gone] = into
+    graph = dict(graph, merged_into=merged)
     if any(b["kind"] == "exit" for b in kept):
         return dict(graph, entry=entry, blocks=kept)
     for b in kept:

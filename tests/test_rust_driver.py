@@ -71,3 +71,89 @@ class RustCheckoutCompilerCrates(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+MUTATE = """pub fn fill(n: usize) -> usize {
+    let mut v = Vec::new();
+    let mut count = 0;
+    for i in 0..n {
+        v.push(i);
+        bump(&mut count);
+    }
+    let r = &mut count;
+    *r += 10;
+    v.len() + count
+}
+fn bump(c: &mut usize) { *c += 1; }
+"""
+
+
+@unittest.skipUnless(have_driver_toolchain(), f"needs the {TOOLCHAIN} toolchain")
+class MirDefUse(unittest.TestCase):
+    def test_writes_through_mut_references_define_the_variable(self):
+        """`bump(&mut count)`, `v.push(i)` and `*r += 10` change a variable without assigning it: the
+        MIR events count them as definitions, and the read after the loop is reached from before it
+        (zero iterations) and from inside it."""
+        from codeflow import _analysis, _cfg
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "Cargo.toml").write_text('[package]\nname = "mx"\nversion = "0.1.0"\nedition = "2021"\n')
+            (root / "src" / "lib.rs").write_text(MUTATE)
+            graph = _cfg.simplify(_cfg.ir_tidy(rust_cfg(root / "src" / "lib.rs", "fill")))
+        count = _analysis.mir_events(graph["dataflow"], "count", graph)
+        self.assertIn((6, "def", "&mut passed to a call"), [(e.line, e.kind, e.how) for e in count])
+        self.assertIn((9, "def", "through a pointer"), [(e.line, e.kind, e.how) for e in count])
+        notes, _ = _analysis.def_use_notes(graph, count, "count")
+        marks = [mark for block in notes.values() for mark in block]
+        self.assertIn("use count :9 ← :3, :6", marks)
+        v = _analysis.mir_events(graph["dataflow"], "v", graph)
+        self.assertIn((5, "def", "&mut passed to a call"), [(e.line, e.kind, e.how) for e in v])
+
+
+RAW = """pub struct Holder { pub p: *mut i32, pub tag: u8 }
+pub struct Cfg { pub limit: u32 }
+
+pub fn via_field(seed: i32) -> i32 {
+    let mut x = seed;
+    let mut h = Holder { p: &raw mut x, tag: 0 };
+    h.tag = 1;
+    unsafe { *h.p += 5; }
+    poke(&mut h);
+    x
+}
+fn poke(h: &mut Holder) { unsafe { *h.p = 0; } }
+
+impl Cfg {
+    pub fn adjust(&mut self, extra: u32) -> u32 {
+        if extra > 3 { self.limit = extra; }
+        self.limit + 1
+    }
+}
+"""
+
+
+@unittest.skipUnless(have_driver_toolchain(), f"needs the {TOOLCHAIN} toolchain")
+class MirPointersKeptInFields(unittest.TestCase):
+    def test_a_raw_pointer_kept_in_a_struct_field_traces_back(self):
+        """`h.p = &raw mut x`, then `*h.p += 5` and `poke(&mut h)`: both change `x`, and the read at
+        the end is reached from the call."""
+        from codeflow import _analysis, _cfg
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "Cargo.toml").write_text('[package]\nname = "rx"\nversion = "0.1.0"\nedition = "2021"\n')
+            (root / "src" / "lib.rs").write_text(RAW)
+            fill = _cfg.simplify(_cfg.ir_tidy(rust_cfg(root / "src" / "lib.rs", "via_field")))
+            adjust = _cfg.simplify(_cfg.ir_tidy(rust_cfg(root / "src" / "lib.rs", "Cfg::adjust")))
+        x = _analysis.mir_events(fill["dataflow"], "x", fill)
+        defs = [(e.line, e.how) for e in x if e.kind == "def"]
+        self.assertIn((8, "through a pointer"), defs)
+        self.assertIn((9, "&mut passed to a call"), defs)
+        notes, _ = _analysis.def_use_notes(fill, x, "x")
+        self.assertIn("use x :10 ← :9", [m for block in notes.values() for m in block])
+        limit = _analysis.mir_events(adjust["dataflow"], "self.limit", adjust)
+        notes, _ = _analysis.def_use_notes(adjust, limit, "self.limit")
+        self.assertIn("use self.limit :17 ← :15, :16", [m for block in notes.values() for m in block])

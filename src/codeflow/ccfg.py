@@ -33,9 +33,10 @@ def walk(node):
 
 
 def fn_name(node):
-    declarator = node.child_by_field_name("declarator")
-    while declarator is not None and declarator.type not in ("function_declarator",):
-        declarator = declarator.child_by_field_name("declarator")
+    """The declared name; the function declarator can sit under reference and pointer
+    declarators (`const T& Class::name(...)`), whose inner declarator is not a field."""
+    top = node.child_by_field_name("declarator")
+    declarator = next((n for n in walk(top) if n.type == "function_declarator"), None) if top is not None else None
     if declarator is None:
         return None
     name = declarator.child_by_field_name("declarator")

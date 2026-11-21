@@ -24,6 +24,8 @@ use rustc_public::mir::{
     TerminatorKind, UnwindAction, VarDebugInfoContents,
 };
 use rustc_public::ty::{GenericArgs, RigidTy, Span, Ty, TyConst, TyConstKind, TyKind};
+use rustc_public::mir::visit::{Location, PlaceContext, statement_location};
+use rustc_public::mir::MirVisitor;
 use rustc_public::visitor::{Visitable, Visitor};
 use rustc_public::{CrateDef, CrateItem, ItemKind};
 use serde_json::{Value, json};
@@ -219,12 +221,14 @@ fn dump(query: &Query, file: Option<&Path>) -> Result<Value, String> {
             })
         })
         .collect();
+    let start_line = item.span().get_lines().start_line;
     Ok(json!({
         "function": item.name(),
         "file": file,
-        "line": item.span().get_lines().start_line,
+        "line": start_line,
         "entry": 0,
         "blocks": blocks,
+        "dataflow": cfg.dataflow(start_line),
     }))
 }
 
@@ -257,6 +261,18 @@ fn local_names(body: &Body) -> HashMap<Local, String> {
         .collect()
 }
 
+/// Every place an rvalue or operand touches, and whether the access mutates it (`&mut x`,
+/// `&raw mut x`).
+struct Places {
+    found: Vec<(Place, bool)>,
+}
+
+impl MirVisitor for Places {
+    fn visit_place(&mut self, place: &Place, ptx: PlaceContext, _location: Location) {
+        self.found.push((place.clone(), ptx.is_mutating()));
+    }
+}
+
 struct Cfg<'a> {
     body: &'a Body,
     file: PathBuf,
@@ -264,6 +280,202 @@ struct Cfg<'a> {
 }
 
 impl Cfg<'_> {
+    /// A place as the source spells it: the variable and its field path (`self.cfg.limit`), derefs
+    /// dropped; `None` for a compiler temporary. Stops at an index or a variant downcast.
+    fn place_path(&self, place: &Place) -> Option<String> {
+        let mut path = self.names.get(&place.local)?.clone();
+        let mut ty = self.body.locals().get(place.local)?.ty;
+        for elem in &place.projection {
+            match elem {
+                ProjectionElem::Deref => {}
+                ProjectionElem::Field(index, _) => {
+                    let name = match ty.kind() {
+                        TyKind::RigidTy(RigidTy::Adt(def, _)) if def.num_variants() == 1 => {
+                            def.variants()[0].fields().get(*index).map(|field| field.name.clone())
+                        }
+                        TyKind::RigidTy(RigidTy::Tuple(_)) => Some(index.to_string()),
+                        _ => None,
+                    };
+                    let Some(name) = name else { break };
+                    path = format!("{path}.{name}");
+                }
+                _ => break,
+            }
+            let Ok(next) = elem.ty(ty) else { break };
+            ty = next;
+        }
+        Some(path)
+    }
+
+    /// The defs and uses of the function's named variables and their fields, in MIR order, as
+    /// `{"line", "col", "var", "kind": "def"|"use", "how", "block"}`. An assignment, a call's result
+    /// or a parameter defines a place; so does a call it is passed to as `&mut` (`v.push(x)`) and a
+    /// write through a reference or raw pointer to it, wherever that pointer was kept: a temporary,
+    /// a copy of one, or a struct field (`s.p = &raw mut x; ... *s.p = 1`), and a call given the
+    /// struct that holds it.
+    fn dataflow(&self, start_line: usize) -> Vec<Value> {
+        type Key = (Local, Vec<usize>);
+        /// The field path of a place up to its first deref (where the pointer is kept), or `None`
+        /// when it has none.
+        fn key_before_deref(place: &Place) -> Option<Key> {
+            let mut fields = Vec::new();
+            for elem in &place.projection {
+                match elem {
+                    ProjectionElem::Field(index, _) => fields.push(*index),
+                    ProjectionElem::Deref => return Some((place.local, fields)),
+                    _ => return None,
+                }
+            }
+            None
+        }
+        /// The place's own key when it is only fields (no deref).
+        fn key(place: &Place) -> Option<Key> {
+            let mut fields = Vec::new();
+            for elem in &place.projection {
+                match elem {
+                    ProjectionElem::Field(index, _) => fields.push(*index),
+                    _ => return None,
+                }
+            }
+            Some((place.local, fields))
+        }
+        let body = self.body;
+        let mut events = Vec::new();
+        // Places that hold `&mut x` or `&raw mut x`, by where they are kept: the variable they point
+        // to, and that place's own key (so pointers kept inside it are reachable through it).
+        let mut borrows: HashMap<Key, (String, Option<Key>)> = HashMap::new();
+        let push = |events: &mut Vec<Value>, block: usize, span: &Span, var: Option<String>, kind: &str, how: &str| {
+            let Some(var) = var else { return };
+            if span_file(span) != self.file {
+                return;
+            }
+            let l = span.get_lines();
+            if l.start_line == 0 {
+                return;
+            }
+            events.push(json!({"line": l.start_line, "col": l.start_col, "var": var, "kind": kind, "how": how, "block": block}));
+        };
+        for local in 1..=body.arg_locals().len() {
+            if let Some(name) = self.names.get(&local) {
+                events.push(json!({"line": start_line, "col": 1, "var": name, "kind": "def", "how": "parameter", "block": 0}));
+            }
+        }
+        // What a read of `place` stands for: the variable a kept pointer points to, else the place.
+        let through = |borrows: &HashMap<Key, (String, Option<Key>)>, place: &Place| -> Option<String> {
+            key_before_deref(place).and_then(|k| borrows.get(&k).map(|(path, _)| path.clone()))
+        };
+        // Every variable a call given `key` can write: what the pointers kept in it (or in its fields)
+        // point to, and, through a pointer to a struct, the pointers kept inside that struct.
+        let reachable = |borrows: &HashMap<Key, (String, Option<Key>)>, start: Key| -> Vec<String> {
+            let mut found = Vec::new();
+            let mut queue = vec![start];
+            let mut seen: HashSet<Key> = HashSet::new();
+            while let Some((local, fields)) = queue.pop() {
+                if !seen.insert((local, fields.clone())) {
+                    continue;
+                }
+                for ((l, f), (path, inner)) in borrows {
+                    if *l == local && f.starts_with(&fields) {
+                        found.push(path.clone());
+                        if let Some(inner) = inner {
+                            queue.push(inner.clone());
+                        }
+                    }
+                }
+            }
+            found.sort();
+            found.dedup();
+            found
+        };
+        for (index, block) in body.blocks.iter().enumerate() {
+            for (position, statement) in block.statements.iter().enumerate() {
+                let StatementKind::Assign(destination, rvalue) = &statement.kind else { continue };
+                let span = &statement.source_info.span;
+                let mut places = Places { found: Vec::new() };
+                places.visit_rvalue(rvalue, statement_location(body, &index, position));
+                let destination_key = key(destination);
+                for (place, mutating) in &places.found {
+                    let target = through(&borrows, place).or_else(|| self.place_path(place));
+                    if *mutating {
+                        // `&mut x` / `&raw mut x` kept in the destination (a local or a field).
+                        if let (Some(k), Some(target)) = (destination_key.clone(), target) {
+                            let pointee = key(place).or_else(|| key_before_deref(place).and_then(|k| borrows.get(&k).and_then(|(_, inner)| inner.clone())));
+                            borrows.insert(k, (target, pointee));
+                        }
+                    } else {
+                        push(&mut events, index, span, target, "use", "");
+                    }
+                }
+                // A copy or move of a kept pointer, or a struct built around one, still points there.
+                match rvalue {
+                    Rvalue::Use(Operand::Copy(source) | Operand::Move(source), _) => {
+                        if let (Some(from), Some(to)) = (key(source), destination_key.clone()) {
+                            let carried: Vec<(Key, (String, Option<Key>))> = borrows
+                                .iter()
+                                .filter(|((local, fields), _)| *local == from.0 && fields.starts_with(&from.1))
+                                .map(|((_, fields), target)| {
+                                    let mut moved = to.1.clone();
+                                    moved.extend_from_slice(&fields[from.1.len()..]);
+                                    ((to.0, moved), target.clone())
+                                })
+                                .collect();
+                            borrows.extend(carried);
+                        }
+                    }
+                    Rvalue::Aggregate(_, operands) => {
+                        if let Some(to) = destination_key.clone() {
+                            for (field, operand) in operands.iter().enumerate() {
+                                if let Operand::Copy(source) | Operand::Move(source) = operand
+                                    && let Some(from) = key(source)
+                                    && let Some(target) = borrows.get(&from).cloned()
+                                {
+                                    let mut fields = to.1.clone();
+                                    fields.push(field);
+                                    borrows.insert((to.0, fields), target);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if destination.projection.iter().any(|e| matches!(e, ProjectionElem::Deref)) {
+                    match through(&borrows, destination) {
+                        Some(target) => push(&mut events, index, span, Some(target), "def", "through a pointer"),
+                        None => push(&mut events, index, span, self.place_path(destination), "def", "field"),
+                    }
+                } else {
+                    let how = if destination.projection.is_empty() { "" } else { "field" };
+                    push(&mut events, index, span, self.place_path(destination), "def", how);
+                }
+            }
+            let span = &block.terminator.source_info.span;
+            match &block.terminator.kind {
+                TerminatorKind::Call { args, destination, .. } => {
+                    for arg in args {
+                        let (Operand::Copy(place) | Operand::Move(place)) = arg else { continue };
+                        // Every pointer the argument holds (itself, fields of a struct, pointers kept
+                        // in what it points to) lets the callee write.
+                        let held = key(place).map(|k| reachable(&borrows, k)).unwrap_or_default();
+                        if held.is_empty() {
+                            push(&mut events, index, span, through(&borrows, place).or_else(|| self.place_path(place)), "use", "");
+                        }
+                        for target in held {
+                            push(&mut events, index, span, Some(target), "def", "&mut passed to a call");
+                        }
+                    }
+                    if destination.projection.is_empty() {
+                        push(&mut events, index, span, self.place_path(destination), "def", "call result");
+                    }
+                }
+                TerminatorKind::SwitchInt { discr: Operand::Copy(place) | Operand::Move(place), .. } => {
+                    push(&mut events, index, span, self.place_path(place), "use", "");
+                }
+                _ => {}
+            }
+        }
+        events
+    }
+
     fn lines(&self, block: &BasicBlock) -> Option<[usize; 2]> {
         let spans = block
             .statements

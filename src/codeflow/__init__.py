@@ -23,6 +23,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import _scip
+
 __all__ = ["FlowGraph", "FlowTree", "cfg", "recursion", "tree"]
 
 # The language servers index the workspace the session started in: this module is imported with the kernel.
@@ -80,7 +82,8 @@ async def tree(
     external: bool = False,
     backend: str | None = None,
 ) -> FlowTree:
-    """The call tree of the function at ``at`` in ``path``.
+    """The call tree of the function at ``at`` in ``path`` (``cfg(path, at, callers=N)`` and
+    ``callees=N`` show the same tree next to the function's graph).
 
     ``direction``: ``"outgoing"`` (what it calls) or ``"incoming"`` (who calls
     it). ``depth`` bounds the levels. LSP trees expand only functions under
@@ -95,8 +98,26 @@ async def tree(
     file = Path(path).expanduser().resolve()
     if not file.is_file():
         raise FileNotFoundError(file)
+    file, note = await asyncio.to_thread(_locate, file, at, root)
+    result = await _tree(file, at, direction, depth, root, external, backend)
+    if note:
+        result.text = f"note: {note}\n{result.text}"
+    return result
+
+
+async def _tree(file: Path, at: str | int, direction: str, depth: int, root, external: bool, backend: str | None) -> FlowTree:
     if file.suffix in _JS and (backend == "acorn" or (backend is None and not _js_project(file))):
         return await asyncio.to_thread(_js_tree, file, at, direction, depth)
+    if file.suffix == ".rs" and backend in (None, "scip"):
+        # The workspace's SCIP index answers without a language server; any failure falls back to one.
+        from . import _scip_tree
+
+        try:
+            return await _scip_tree.tree(file, at, direction, depth, _root(file, root))
+        except (_scip.ScipError, LookupError, OSError, ValueError) as error:
+            if backend == "scip":
+                raise
+            _scip_note(error)
     try:
         return await _lsp_tree(file, at, direction, depth, _root(file, root), external)
     except (RuntimeError, LookupError):
@@ -140,6 +161,11 @@ async def cfg(
     root: str | os.PathLike[str] | None = None,
     follow: int = 0,
     follow_limit: int = 20,
+    callers: int = 0,
+    callees: int = 0,
+    var: str | None = None,
+    refs: bool = False,
+    dominators: bool = False,
 ) -> FlowGraph:
     """The control-flow graph of ``function`` in ``path``: its blocks with their source lines, what ends
     each (a branch condition, a loop, a call, a return, a raise), and the edges between them.
@@ -154,6 +180,18 @@ async def cfg(
     ``follow=N`` also shows the graph of each project function it calls, ``N`` levels deep (callees
     from the language server's call hierarchy, or acorn's for JavaScript bundles; each shown once;
     at most ``follow_limit`` per function, the rest counted in a "… N more callees" line).
+    ``callers=N`` prints who calls it (N levels, each call site as file:line) above the graph;
+    ``callees=N`` lists what it calls (N levels) below it, without their graphs.
+    ``var="x"`` marks every block that defines or reads ``x`` (``self.x`` works too) and, at each
+    read, the definitions that can reach it (reaching definitions over the graph); a read no
+    definition in the function reaches is a value from outside. ``refs=True`` lists every site that
+    names it across the project, grouped by what it does there (call, write, read, reference taken,
+    type use, import) -- for a field, constant or type too, which have no graph.
+    ``dominators=True`` notes under each block the blocks every path to it runs first.
+
+    A name that is not defined in ``path`` is looked up in the project (the file it is found in is
+    named in the header). A Rust crate that does not compile gives a syntax-level graph
+    (tree-sitter) instead of MIR, with the build's first error in the header.
     """
     if level not in ("source", "async", "mir"):
         raise ValueError("level must be 'source', 'async' or 'mir'")
@@ -163,6 +201,37 @@ async def cfg(
     file = Path(path).expanduser().resolve()
     if not file.is_file():
         raise FileNotFoundError(file)
+    file, note = await asyncio.to_thread(_locate, file, function, root)
+    refs_text = await _references(file, function, root) if refs else None
+    try:
+        graph = await _build(file, function, level, cleanup)
+    except (LookupError, RuntimeError) as error:
+        if refs_text is None:
+            raise
+        # Not a function (a field, a constant, a type): its references are the answer.
+        why = str(error).splitlines()[0][:160]
+        return FlowGraph(str(function), f"{refs_text}\n\n(no control-flow graph: {why})", {})
+    simple = _cfg.simplify(graph, cleanup=cleanup)
+    base = _root(file, root)
+    notes, tail = await _annotations(file, simple, var, dominators)
+    result = FlowGraph(str(graph["function"]), _cfg.render(simple, base, notes) + tail, simple)
+    if note:
+        result.text = f"note: {note}\n{result.text}"
+    if refs_text is not None:
+        result.text = f"{refs_text}\n\n{result.text}"
+    if callers > 0:
+        result.text = f"{await _call_tree(file, graph, 'incoming', callers, base)}\n\n{result.text}"
+    if callees > 0:
+        result.text += f"\n\n{await _call_tree(file, graph, 'outgoing', callees, base)}"
+    if follow > 0:
+        await _follow(result, file, graph, base, level, cleanup, follow, {(str(file), graph["line"])}, follow_limit)
+    return result
+
+
+async def _build(file: Path, function: str | int, level: str, cleanup: bool) -> dict:
+    """The graph of ``function`` from the backend for ``file``'s language."""
+    from . import _cfg
+
     if isinstance(function, str) and re.fullmatch(r"\d+:\d+", function) and file.suffix != ".rs":
         function = int(function.split(":")[0])  # only Rust tells closures on one line apart by column
     if file.suffix == ".py":
@@ -207,18 +276,249 @@ async def cfg(
             graph = await asyncio.to_thread(_run_json, ["uv", "run", "--quiet", "--script", str(_HERE / "ccfg.py"), str(file), function])
             graph["source"] = f"tree-sitter, syntax only: {reason}"
     elif file.suffix == ".rs":
-        from ._rust_cfg import rust_cfg
-
-        graph = _cfg.ir_tidy(await asyncio.to_thread(rust_cfg, file, function), cleanup=cleanup, level=level)
-        graph["source"] = "rustc MIR"
+        graph = await _rust_graph(file, function, cleanup, level)
     else:
         raise ValueError(f"no control-flow backend for {file.suffix} files")
-    simple = _cfg.simplify(graph, cleanup=cleanup)
+    return graph
+
+
+async def _annotations(file: Path, graph: dict, var: str | None, show_dominators: bool) -> tuple[dict[int, list[str]], str]:
+    """Notes under the blocks (``var``'s defs and uses with the definitions reaching each use, each
+    block's dominators) and a closing summary line."""
+    from . import _analysis
+
+    notes: dict[int, list[str]] = {}
+    tail = ""
+    if show_dominators:
+        notes = _analysis.dominator_notes(graph)
+    if var:
+        if file.suffix == ".py":
+            events = await asyncio.to_thread(_analysis.python_events, file, str(graph["function"]), var)
+        elif graph.get("dataflow") is not None:
+            # Rust from MIR: writes through `&mut` and raw pointers (wherever they were kept) count too.
+            events = _analysis.mir_events(graph["dataflow"], var, graph)
+        else:
+            spans = [b["lines"] for b in graph["blocks"] if b["lines"]]
+            first = min([int(graph["line"]), *(l[0] for l in spans)])
+            last = max([int(graph["line"]), *(l[1] for l in spans)])
+            events = await asyncio.to_thread(_analysis.syntax_events, file, first, last, var, int(graph["line"]))
+        marks, outside = _analysis.def_use_notes(graph, events, var)
+        for block, lines in marks.items():
+            notes.setdefault(block, []).extend(lines)
+        defs = sum(1 for e in events if e.kind == "def")
+        uses = sum(1 for e in events if e.kind == "use")
+        tail = f"\n\n`{var}`: {defs} definitions, {uses} uses"
+        if outside:
+            tail += f"; read before any definition here (a value from outside the function): {', '.join(outside[:10])}"
+        if not events:
+            tail = f"\n\n`{var}` does not appear in this function"
+    return notes, tail
+
+
+async def _references(file: Path, name: str | int, root) -> str:
+    """Every site that names ``name``, grouped by what it does there: the language server's
+    references when one answers, else a whole-word search of the project's files of that language."""
+    from . import _analysis
+
+    if isinstance(name, int) or re.fullmatch(r"\d+(:\d+)?", str(name)):
+        raise ValueError("refs=True takes a name, not a line")
+    short = re.split(r"::|\.", str(name))[-1]
     base = _root(file, root)
-    result = FlowGraph(str(graph["function"]), _cfg.render(simple, base), simple)
-    if follow > 0:
-        await _follow(result, file, graph, base, level, cleanup, follow, {(str(file), graph["line"])}, follow_limit)
-    return result
+    sites: list[tuple[Path, int, int]] = []
+    source = "project search"
+    definition = _definition_site(file, short)
+    is_function = definition is not None and bool(re.search(
+        r"\b(?:fn|def|function)\s", file.read_text(errors="replace").splitlines()[definition[0] - 1]))
+    try:
+        from rlm import lsp
+
+        at = definition or _name_position(file, short)
+        if at is not None:
+            answer = await lsp.references(str(file), at[0], at[1])
+            if answer.available and answer.items:
+                sites = [(Path(i["path"]).resolve(), int(i["line"]), int(i.get("column") or i.get("col") or 1)) for i in answer.items]
+                source = answer.server or "language server"
+    except Exception:  # noqa: BLE001 - no kernel or no server: the project search
+        sites = []
+    if not sites:
+        sites = await asyncio.to_thread(_search_sites, base, short, file.suffix)
+    sites = [s for s in sites if not (_VENDORED & set(s[0].relative_to(base).parts[:-1]) if s[0].is_relative_to(base) else False)]
+    cache: dict[Path, list[str]] = {}
+    classified = []
+    for path, line, col in sorted(set(sites)):
+        lines = cache.setdefault(path, path.read_text(errors="replace").splitlines() if path.is_file() else [])
+        text = lines[line - 1] if 0 < line <= len(lines) else ""
+        if not text[col - 1: col - 1 + len(short)] == short:  # a server's column in UTF-16 or 0-based: re-find it
+            found = re.search(rf"(?<![\w$]){re.escape(short)}(?![\w$])", text)
+            col = found.start() + 1 if found else col
+        is_definition = definition is not None and path == file.resolve() and line == definition[0]
+        kind = _analysis.classify(text, col, short, path.suffix, is_definition, is_function)
+        classified.append((path, line, col, kind, _analysis.enclosing(lines, line, path.suffix)))
+    return _analysis.render_references(short, classified, base, source)
+
+
+def _definition_site(file: Path, name: str) -> tuple[int, int] | None:
+    """Where ``name`` is declared in ``file``: a function, type, field, constant or variable."""
+    patterns = (
+        rf"\b(?:fn|def|class|struct|enum|trait|union|type|mod|const|static|let|var|function|interface)\s+(?:mut\s+)?{re.escape(name)}\b",
+        rf"^\s*(?:pub(?:\([^)]*\))?\s+)?{re.escape(name)}\s*:",  # a struct field
+        rf"^{re.escape(name)}\s*(?::[^=]*)?=(?!=)",  # a module-level assignment (Python, JS)
+        rf"\b(?:struct|class|union)\b[^{{]*\{{[^}}]*?(?:pub(?:\([^)]*\))?\s+)?\b{re.escape(name)}\s*:",  # a field of a one-line struct
+    )
+    try:
+        lines = file.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for pattern in patterns:
+        compiled = re.compile(pattern)
+        for index, text in enumerate(lines):
+            match = compiled.search(text)
+            if match:
+                return index + 1, text.find(name, match.start()) + 1
+    return None
+
+
+def _search_sites(base: Path, name: str, suffix: str) -> list[tuple[Path, int, int]]:
+    """Whole-word occurrences of ``name`` in the project's files of ``suffix``'s language."""
+    globs = _FAMILY.get(suffix, (f"*{suffix}",))
+    try:
+        run = subprocess.run(
+            ["git", "-C", str(base), "grep", "-n", "--column", "-w", "-F", name, "--", *globs],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    sites = []
+    for line in run.stdout.splitlines()[:2000]:
+        path, number, column, _ = (line.split(":", 3) + ["", "", ""])[:4]
+        if number.isdigit() and column.isdigit():
+            sites.append(((base / path).resolve(), int(number), int(column)))
+    return sites
+
+
+async def _call_tree(file: Path, graph: dict, direction: str, depth: int, base: Path) -> str:
+    """``graph``'s function's callers or callees as a tree; a failed lookup is one line, never an error."""
+    short = str(graph["function"]).split("::")[-1].split(".")[-1].split("<")[0]
+    position = _name_position(file, short, near=max(1, int(graph["line"]) - 10))
+    at: str | int = f"{position[0]}:{position[1]}" if position else int(graph["line"])
+    if file.suffix in _JS and not _js_project(file):
+        at = str(graph["function"])
+    try:
+        return (await tree(file, at, direction=direction, depth=depth, root=base)).text
+    except (LookupError, RuntimeError, ValueError) as error:
+        word = "callers" if direction == "incoming" else "callees"
+        return f"{word}: none found ({str(error).splitlines()[0][:200]})"
+
+
+async def _rust_graph(file: Path, function: str | int, cleanup: bool, level: str) -> dict:
+    """The MIR graph; a name the compiler does not match is retried by its definition line (a
+    generic impl, a test module), and a crate that does not build gives the syntax graph."""
+    from . import _cfg
+    from ._rust_cfg import rust_cfg
+
+    try:
+        graph = _cfg.ir_tidy(await asyncio.to_thread(rust_cfg, file, function), cleanup=cleanup, level=level)
+        graph["source"] = "rustc MIR"
+        return graph
+    except RuntimeError as error:
+        message = str(error)
+    if "no local function matches" in message or "is ambiguous" in message:
+        lines = await asyncio.to_thread(_rust_definition_lines, file, str(function))
+        if len(lines) > 1:
+            choices = ", ".join(f"{name} (line {line})" for line, name in lines)
+            raise LookupError(f"`{function}` is ambiguous in {file.name}: {choices}; pass one of these or a line")
+        if len(lines) == 1:
+            try:
+                graph = _cfg.ir_tidy(await asyncio.to_thread(rust_cfg, file, lines[0][0]), cleanup=cleanup, level=level)
+                graph["source"] = "rustc MIR"
+                return graph
+            except RuntimeError as error:
+                message = str(error)
+        reason = "the compiler does not build this function in the crate's library or binary (a test module, a cfg'd-out item?)"
+    else:
+        reason = _build_error(message)
+    graph = await asyncio.to_thread(_run_json, ["uv", "run", "--quiet", "--script", str(_HERE / "rcfg.py"), str(file), str(function)])
+    graph["source"] = f"tree-sitter, syntax only: {reason}"
+    return graph
+
+
+def _build_error(message: str) -> str:
+    """The first compiler error in a failed build's output, for the syntax graph's header."""
+    for line in message.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("error") and "could not compile" not in stripped:
+            return f"the crate does not build ({stripped[:160]})"
+    return "the crate does not build"
+
+
+def _rust_definition_lines(file: Path, name: str) -> list[tuple[int, str]]:
+    """The definitions ``name`` (``fn``, ``Type::fn``, ``Trait::fn``) matches in ``file``, by syntax."""
+    run = subprocess.run(
+        ["uv", "run", "--quiet", "--script", str(_HERE / "rcfg.py"), str(file), name, "--lines"],
+        capture_output=True, text=True, timeout=600,
+    )
+    found = []
+    for line in run.stdout.splitlines():
+        number, _, forms = line.partition(" ")
+        if number.isdigit():
+            found.append((int(number), forms))
+    return found
+
+
+_DEFINITIONS = {
+    ".rs": r"\bfn\s+{name}\b",
+    ".py": r"^\s*(?:async\s+)?def\s+{name}\b",
+    **{suffix: r"\bfunction\s*\*?\s*{name}\b|^\s*(?:(?:public|private|protected|static|async|get|set)\s+)*#?{name}\s*\([^)]*\)\s*(?::[^={{]+)?\{{|\b{name}\s*[:=]\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|\w+\s*=>)"
+       for suffix in (*_JS, *_TS)},
+}
+_FAMILY = {".rs": ("*.rs",), ".py": ("*.py",), **{s: ("*.js", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.mts", "*.cts") for s in (*_JS, *_TS)}}
+_SEARCH_FILES = 20_000
+
+
+def _locate(file: Path, function: str | int, root: str | os.PathLike[str] | None) -> tuple[Path, str | None]:
+    """Where ``function`` is defined: ``file`` when it is there (or a line was given, or the
+    language has no text lookup), else the one project file that defines it, with a note. Several
+    candidates raise with their locations."""
+    if isinstance(function, int) or re.fullmatch(r"\d+(:\d+)?", str(function)) or file.suffix not in _DEFINITIONS:
+        return file, None
+    parts = re.split(r"::|\.", str(function))
+    name, owner = parts[-1], (parts[-2] if len(parts) > 1 else None)
+    pattern = re.compile(_DEFINITIONS[file.suffix].format(name=re.escape(name)), re.M)
+
+    def defines(path: Path) -> list[int]:
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            return []
+        if owner and not re.search(rf"\b{re.escape(owner)}\b", text):
+            return []
+        return [text.count("\n", 0, match.start()) + 1 for match in pattern.finditer(text)]
+
+    if defines(file):
+        return file, None
+    base = _root(file, root)
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(base), "ls-files", "-z", "--", *_FAMILY[file.suffix]],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.split("\0")
+    except (OSError, subprocess.SubprocessError):
+        return file, None
+    hits = []
+    for relative in listed[:_SEARCH_FILES]:
+        if not relative or _VENDORED & set(Path(relative).parts[:-1]):
+            continue
+        candidate = base / relative
+        for line in defines(candidate):
+            hits.append((candidate, line))
+    if len({path for path, _ in hits}) == 1:
+        found, line = hits[0]
+        return found, f"`{function}` is not defined in {_rel(str(file), base)}; using {_rel(str(found), base)}:{line}"
+    if hits:
+        places = ", ".join(f"{_rel(str(path), base)}:{line}" for path, line in hits[:10])
+        more = f" and {len(hits) - 10} more" if len(hits) > 10 else ""
+        raise LookupError(f"`{function}` is not defined in {_rel(str(file), base)}; it is defined in {places}{more}: pass that file")
+    return file, None
 
 
 async def _follow(
@@ -657,3 +957,10 @@ def _js_tree(file: Path, at: str | int, direction: str, depth: int) -> FlowTree:
     arrow = "calls" if direction == "outgoing" else "is called by"
     title = f"{start}  {file.name}:{nodes[start]}   [{arrow}, depth {depth}, acorn]"
     return FlowTree(start, direction, _render(title, children(start, 1, frozenset({start}))), edges)
+
+
+def _scip_note(error: Exception) -> None:
+    """Why the SCIP index did not answer (the language server did): on stderr, never the result."""
+    import sys
+
+    print(f"codeflow: SCIP index unavailable ({str(error).splitlines()[0][:200]}); using the language server", file=sys.stderr)

@@ -32,10 +32,10 @@ def displayed(graph: dict) -> dict:
     mapping = {internal: number for number, internal in display_map(graph).items()}
     blocks = []
     for block in graph.get("blocks", []):
-        kept = dict(block, id=str(mapping[int(block["id"])]))
+        kept = dict(block, id=mapping[int(block["id"])])
         kept["succ"] = [dict(edge, to=mapping[int(edge["to"])]) for edge in block.get("succ", []) if int(edge["to"]) in mapping]
         blocks.append(kept)
-    entry = mapping.get(int(graph["entry"]), graph["entry"]) if "entry" in graph else None
+    entry = mapping.get(int(graph["entry"]), graph["entry"]) if "entry" in graph else None  # an int, as the ids are
     return dict(graph, blocks=blocks, entry=entry, names={str(n): f"B{n}" for n in mapping.values()})
 
 

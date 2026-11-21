@@ -85,7 +85,8 @@ class DisplayedNumbers(unittest.TestCase):
 
     def test_the_displayed_graph_renumbers_ids_and_edges(self):
         out = _views.displayed(self.GRAPH)
-        self.assertEqual([b["id"] for b in out["blocks"]], ["0", "1", "2"])
+        self.assertEqual([b["id"] for b in out["blocks"]], [0, 1, 2])
+        self.assertTrue(all(isinstance(e["to"], int) for b in out["blocks"] for e in b["succ"]))
         self.assertEqual(out["blocks"][0]["succ"], [{"to": 1, "label": ""}])
         self.assertEqual(out["entry"], 0)
 

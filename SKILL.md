@@ -92,9 +92,36 @@ codeflow mcp                                                   # stdio MCP serve
 Run it as `uv run --project ~/.prime/agent/skills/codeflow codeflow ...`, `python -m codeflow ...`, or the venv's
 `.venv/bin/codeflow`. Flags: `--function NAME` (or a second positional: a name, a line, `LINE:COL`), `--callers N`,
 `--callees N`, `--follow N`, `--follow-limit N`, `--var NAME`, `--refs`, `--dominators`, `--level`, `--cleanup`,
-`--root DIR`, `--json`. Claude Code registration (user scope):
+`--root DIR`, `--json`, and the views below. Claude Code registration (user scope):
 `claude mcp add --scope user codeflow -- ~/.prime/agent/skills/codeflow/.venv/bin/codeflow mcp`. The MCP server keeps
 its language servers up between calls; one CLI call starts and stops them.
+
+### Views of a big graph
+
+Block numbers are the displayed ones (`B7`), in the text and in `--json` (ids, `entry` and edge targets are
+integers).
+
+```sh
+codeflow cfg src/lib.rs run --out /tmp/run.cfg.txt          # write the whole output to a file, print a summary
+codeflow cfg src/lib.rs run --blocks 12-30                  # only these blocks (also 3,5,9 or B3-B9), edges inside the range
+codeflow cfg src/lib.rs run --path-from B3 --path-to B40    # the simple paths between two blocks, shortest first (at most 50)
+```
+
+### Rust call trees from the SCIP index, and `query`
+
+Rust callers and callees come from a SCIP index of the workspace (`rust-analyzer scip`), stored as SQLite at
+`~/.cache/codeflow/scip/<workspace hash>/index.sqlite` (tables `occ` for occurrences, `names`, `meta`). A query
+reads only the rows it needs (tens of milliseconds); a line inside a function body (a closure's included) names
+the enclosing function. The first query on a workspace starts the export in the background and answers from
+rust-analyzer meanwhile (`[... rust, scip]` in the header says which answered); a workspace whose sources or
+lockfile changed is exported again. The export peaks around 6 GB of memory on a large workspace (kuna).
+
+```sh
+codeflow query "SELECT symbol, count(*) FROM occ WHERE roles & 1 = 0 GROUP BY symbol ORDER BY 2 DESC" --limit 20
+codeflow query "SELECT path, line FROM occ WHERE symbol LIKE '%flatten().' AND roles & 1" --json
+```
+
+`query` runs one read-only `SELECT` (or `WITH ... SELECT`) on the index of the project it is run in (`--root`).
 
 ## Limits
 
@@ -141,4 +168,6 @@ its language servers up between calls; one CLI call starts and stops them.
 - `follow=N` appends each project callee's graph (`── calls name  path:line (at lines)`, nested with `│`), N levels,
   each function once, at most `follow_limit` per function; the rest are named in a `── … N more callees` line.
 - JS/TS need `node`, `acorn` and `@sveltejs/acorn-typescript` (`npm ci` in `src/codeflow` after a fresh clone); C needs `uv` (tree-sitter grammars are pinned in
-  `ccfg.py`'s script header); Rust needs the `rustc-master` toolchain (the driver rebuilds itself when it changes).
+  `ccfg.py`'s script header); Rust needs the `rustc-master` toolchain (the driver rebuilds itself when it changes). The Rust MIR build
+  goes to `~/.cache/codeflow/mir/<workspace hash>` (`CODEFLOW_TARGET_DIR` overrides), never to the project's
+  `target/` or the user's `CARGO_TARGET_DIR`: its own rustc driver would invalidate their builds.

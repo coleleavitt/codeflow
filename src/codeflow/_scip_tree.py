@@ -37,6 +37,8 @@ def _start_symbol(index: SqlIndex, rel: str, line0: int, col0: int | None, name:
     for symbol in index.definition_on_line(rel, line0):
         if name is None or _scip._descriptor_name(symbol) == name:
             return symbol
+    if name is None:  # a line inside a body: the function it is written in (a closure's lines included)
+        return index.enclosing_callable(rel, line0, col0 or 0)
     return None
 
 

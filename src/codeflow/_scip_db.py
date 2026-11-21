@@ -87,8 +87,9 @@ class SqlIndex:
         row = self.db.execute("SELECT name FROM names WHERE symbol = ?", (symbol,)).fetchone()
         return row["name"] if row else _descriptor_name(symbol)
 
-    def _enclosing_callable(self, path: str, line: int, col: int) -> str | None:
-        """The innermost callable whose definition body holds (line, col) in ``path``."""
+    def enclosing_callable(self, path: str, line: int, col: int) -> str | None:
+        """The innermost callable whose definition body holds (line, col) in ``path``. Closures have no symbol
+        in the export, so a position inside a closure gives the function it is written in."""
         rows = self.db.execute(
             """SELECT symbol, el, ec, eel, eec FROM occ
                WHERE path = ? AND roles & 1 AND el IS NOT NULL
@@ -111,7 +112,7 @@ class SqlIndex:
         out: list[tuple[str, str, int, int]] = []
         seen: set[tuple[str, str, int, int]] = set()
         for ref in refs:
-            caller = self._enclosing_callable(ref["path"], ref["line"], ref["col"])
+            caller = self.enclosing_callable(ref["path"], ref["line"], ref["col"])
             if caller is None or caller == symbol:
                 continue
             key = (caller, ref["path"], ref["line"], ref["col"])

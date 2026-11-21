@@ -122,6 +122,15 @@ def parser() -> argparse.ArgumentParser:
     cfg.add_argument("--cleanup", action="store_true", default=None, help="add unwind/cleanup paths")
     cfg.add_argument("--root", metavar="DIR", help="the project root (default: the file's git root)")
     cfg.add_argument("--json", action="store_true", help="print {function, text, graph} as JSON")
+    cfg.add_argument("--out", metavar="FILE", help="write the whole output to FILE (text, or JSON with --json) and print a summary")
+    cfg.add_argument("--blocks", metavar="SPEC", help="only these blocks: 12-30, 3,5,9, or both")
+    cfg.add_argument("--path-from", dest="path_from", metavar="B", type=int, help="the paths from block B ...")
+    cfg.add_argument("--path-to", dest="path_to", metavar="B", type=int, help="... to block B (at most 50, shortest first)")
+    query = commands.add_parser("query", help="read-only SQL over a project's SCIP index (Rust): tables occ, names")
+    query.add_argument("sql", help="one SELECT (or WITH ... SELECT) statement")
+    query.add_argument("--root", metavar="DIR", help="a directory of the project (default: the current one)")
+    query.add_argument("--limit", type=int, default=200, metavar="N", help="at most N rows (200)")
+    query.add_argument("--json", action="store_true", help="print the rows as a JSON list")
     commands.add_parser("mcp", help="serve the codeflow tools over MCP (stdio)")
     return top
 
@@ -148,18 +157,80 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "mcp":
         asyncio.run(serve())
         return 0
+    if args.command == "query":
+        return run_query(args)
     if args.function is not None and args.function_flag is not None:
         parser().error("give the function once: positional or --function")
     function = args.function if args.function is not None else args.function_flag
     try:
         result = asyncio.run(_with_servers(run_cfg(args.target, function, vars(args))))
+        graph_text, graph = apply_views(args, result)
     except (LookupError, ValueError, FileNotFoundError, RuntimeError) as error:
         print(f"codeflow: {error}", file=sys.stderr)
         return 1
-    if args.json:
-        print(json.dumps({"function": result.function, "text": result.text, "graph": result.graph}, indent=1, default=str))
+    body = (json.dumps({"function": result.function, "text": graph_text, "graph": graph}, indent=1, default=str)
+            if args.json else graph_text)
+    if args.out:
+        Path(args.out).write_text(body + "\n")
+        print(f"wrote {len(body.splitlines())} lines to {args.out} ({result.function})")
     else:
-        print(result.text)
+        print(body)
+    return 0
+
+
+def apply_views(args: argparse.Namespace, result) -> tuple[str, dict]:
+    """The text and graph to print: the whole result, or the --blocks range or the --path-from/--path-to paths."""
+    from . import _cfg, _views
+
+    if args.blocks is None and args.path_from is None and args.path_to is None:
+        return result.text, result.graph
+    graph = result.graph
+    if args.path_from is not None or args.path_to is not None:
+        if args.path_from is None or args.path_to is None:
+            raise ValueError("--path-from and --path-to go together")
+        found, more = _views.paths(graph, args.path_from, args.path_to)
+        return _views.render_paths(found, more, args.path_from, args.path_to), {"paths": found, "more": more}
+    sub = _views.subgraph(graph, _views.parse_blocks(args.blocks))
+    return _cfg.render(sub, Path.cwd()), sub
+
+
+def run_query(args: argparse.Namespace) -> int:
+    """Read-only SQL over the project's SCIP index, rows capped at --limit."""
+    from . import _lsp_client, _scip, _scip_db
+
+    if args.limit < 1:
+        print("codeflow: --limit takes at least 1", file=sys.stderr)
+        return 1
+    statement = args.sql.strip().rstrip(";").strip()
+    if ";" in statement or not re.match(r"(?is)^(select|with)\b", statement):
+        print("codeflow: query takes one SELECT (or WITH ... SELECT) statement", file=sys.stderr)
+        return 1
+    # A directory has no suffix, so ask for a file inside it: the workspace (Cargo.toml) above it is found.
+    root = _lsp_client._project_root(Path(args.root or ".").expanduser().resolve() / "query.rs")
+    db_path = _scip.cached(root)
+    if db_path is None:
+        print(f"codeflow: no current SCIP index for {root}; a Rust cfg query there builds it", file=sys.stderr)
+        return 1
+    index = _scip_db.SqlIndex(db_path)
+    try:
+        cursor = index.db.execute(statement)
+        columns = [d[0] for d in cursor.description or []]
+        rows = cursor.fetchmany(args.limit + 1)
+    except sqlite3.Error as error:
+        print(f"codeflow: {error}", file=sys.stderr)
+        return 1
+    finally:
+        index.close()
+    more = len(rows) > args.limit
+    rows = rows[: args.limit]
+    if args.json:
+        print(json.dumps([dict(zip(columns, tuple(r))) for r in rows], indent=1, default=str))
+    else:
+        print("\t".join(columns))
+        for row in rows:
+            print("\t".join("" if v is None else str(v) for v in tuple(row)))
+        if more:
+            print(f"… more rows (raise --limit above {args.limit})")
     return 0
 
 

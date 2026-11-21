@@ -1,6 +1,6 @@
-"""The call tree of a Rust function from the workspace's SCIP index (``_scip``): no language server is
-started for the query, so a repeat query is a file read. Used before the language server; a failed
-export or an unreadable index falls back to the server (``codeflow.tree``), never to an error.
+"""The call tree of a Rust function from the workspace's SCIP index database (``_scip_db``): no language
+server is started for the query, so a repeat query is a few indexed reads. Used before the language
+server; a missing or stale database falls back to the server (``codeflow.tree``), never to an error.
 """
 
 from __future__ import annotations
@@ -11,56 +11,51 @@ from pathlib import Path
 
 from . import _scip
 from ._lsp_client import _project_root
+from ._scip_db import SqlIndex
 
 _MAX_CHILDREN = 40
-_index_cache: dict[tuple[str, float], _scip.Index] = {}
+_open: dict[str, SqlIndex] = {}
 
 
-def _load(index_path: Path) -> _scip.Index:
-    key = (str(index_path), index_path.stat().st_mtime)
-    if key not in _index_cache:
-        _index_cache.clear()  # one workspace at a time: the newest export replaces the old
-        _index_cache[key] = _scip.Index.load(index_path)
-    return _index_cache[key]
+def _open_index(db_path: Path) -> SqlIndex:
+    """One open database per path; a rebuilt one (a new export) replaces the old handle."""
+    key = str(db_path)
+    if key not in _open:
+        for old in _open.values():
+            old.close()
+        _open.clear()
+        _open[key] = SqlIndex(db_path)
+    return _open[key]
 
 
-def _start_symbol(index: _scip.Index, rel: str, line0: int, col0: int | None, name: str | None) -> str | None:
+def _start_symbol(index: SqlIndex, rel: str, line0: int, col0: int | None, name: str | None) -> str | None:
     """The callable at a position: the symbol under the cursor, else the first callable defined on the line."""
-    doc = index.documents.get(rel)
-    if doc is None:
-        return None
     if col0 is not None:
         symbol = index.symbol_at(rel, line0, col0)
-        if symbol and symbol.endswith(_scip._CALLABLE_SUFFIX):
+        if symbol and symbol.endswith(_scip._CALLABLE_SUFFIX) and index.known(symbol):
             return symbol
-    for occ in doc.ordered:
-        if occ.line == line0 and occ.is_definition and occ.symbol.endswith(_scip._CALLABLE_SUFFIX):
-            if name is None or _scip._descriptor_name(occ.symbol) == name:
-                return occ.symbol
+    for symbol in index.definition_on_line(rel, line0):
+        if name is None or _scip._descriptor_name(symbol) == name:
+            return symbol
     return None
 
 
-def _location(index: _scip.Index, symbol: str) -> tuple[str, int]:
-    """(relative path, 1-based line) of a symbol's definition."""
-    path, occ = index.definitions[symbol]
-    return path, occ.line + 1
-
-
 async def tree(file: Path, at: str | int, direction: str, depth: int, root: Path):
-    """A ``FlowTree`` like the language server's, from the SCIP index of ``file``'s workspace."""
+    """A ``FlowTree`` like the language server's, from the SCIP index database of ``file``'s workspace."""
     from . import FlowTree, _name_position, _render, _rel
+
+    workspace = _project_root(file)
 
     def show(rel_path: str) -> str:
         return _rel(str(workspace / rel_path), root)
 
-    workspace = _project_root(file)
-    index_path = await asyncio.to_thread(_scip.cached, workspace)
-    if index_path is None:
+    db_path = await asyncio.to_thread(_scip.cached, workspace)
+    if db_path is None:
         started = await asyncio.to_thread(_scip.start_export, workspace)
         raise LookupError(
             f"the SCIP index of {workspace} is {'being built in the background' if started else 'still being built'}"
         )
-    index = await asyncio.to_thread(_load, index_path)
+    index = await asyncio.to_thread(_open_index, db_path)
     rel = str(file.resolve().relative_to(workspace))
     name: str | None = None
     if isinstance(at, int):
@@ -99,12 +94,14 @@ async def tree(file: Path, at: str | int, direction: str, depth: int, root: Path
             lines = sorted({line for _, line in found})
             where = ", ".join(str(n) for n in lines[:3])
             site_path = show(found[0][0])
+            child_name = index.name(child)
             if direction == "incoming":
-                edges.append((index.name(child), index.name(sym), f"{site_path}:{where}"))
+                edges.append((child_name, index.name(sym), f"{site_path}:{where}"))
             else:
-                edges.append((index.name(sym), index.name(child), f"{site_path}:{where}"))
-            child_path, child_line = _location(index, child)
-            here = f"{index.name(child)}  {show(child_path)}:{child_line}"
+                edges.append((index.name(sym), child_name, f"{site_path}:{where}"))
+            definition = index.definition(child)
+            child_path, child_line = (definition[0], definition[1] + 1) if definition else (found[0][0], lines[0])
+            here = f"{child_name}  {show(child_path)}:{child_line}"
             if where:
                 here += f"  (at {'line' if len(lines) == 1 else 'lines'} {where})"
             if child in expanded:
@@ -119,7 +116,8 @@ async def tree(file: Path, at: str | int, direction: str, depth: int, root: Path
             result.append((f"… {hidden} more", []))
         return result
 
-    top_path, top_line = _location(index, symbol)
+    top = index.definition(symbol)
+    top_path, top_line = (top[0], top[1] + 1) if top else (rel, line0 + 1)
     arrow = "calls" if direction == "outgoing" else "is called by"
     title = f"{index.name(symbol)}  {show(top_path)}:{top_line}   [{arrow}, depth {depth}, rust, scip]"
     kids = build(symbol, 1)

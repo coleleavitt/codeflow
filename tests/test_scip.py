@@ -66,7 +66,9 @@ class TreeFromTheIndex(unittest.TestCase):
         self.patch = unittest.mock.patch.object(_scip, "cache_dir", lambda root: self.cache)
         self.patch.start()
         self.cache.mkdir()
-        shutil.copy(FIXTURES / "tiny.scip", self.cache / "index.scip")
+        from codeflow import _scip_db
+
+        _scip_db.build(FIXTURES / "tiny.scip", self.cache / "index.sqlite")
         (self.cache / "fingerprint").write_text(_scip.fingerprint(self.root) + "\n")
 
     def tearDown(self):
@@ -94,6 +96,44 @@ class TreeFromTheIndex(unittest.TestCase):
         (self.root / "src" / "lib.rs").write_text("pub fn leaf() -> u32 { 9 }\n")
         with self.assertRaises(LookupError):
             self.run_tree("middle", "incoming")
+
+
+class DatabaseAnswersLikeTheReader(unittest.TestCase):
+    """The SQLite database answers the same questions as the in-memory reader, for the same export."""
+
+    @classmethod
+    def setUpClass(cls):
+        from codeflow import _scip_db
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.db_path = Path(cls.tmp.name) / "index.sqlite"
+        _scip_db.build(FIXTURES / "tiny.scip", cls.db_path)
+        cls.mem = _scip.Index.load(FIXTURES / "tiny.scip")
+        cls.db = _scip_db.SqlIndex(cls.db_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.db.close()
+        cls.tmp.cleanup()
+
+    def test_callers_and_callees_match(self):
+        for symbol in self.mem.definitions:
+            self.assertEqual(
+                sorted((c, p, line, col) for c, p, line, col in self.db.callers(symbol)),
+                sorted((c, p, line, col) for c, p, line, col in self.mem.callers(symbol)),
+            )
+            self.assertEqual(
+                sorted(self.db.callees(symbol)),
+                sorted(self.mem.callees(symbol)),
+            )
+
+    def test_names_and_positions_match(self):
+        for symbol in self.mem.definitions:
+            self.assertEqual(self.db.name(symbol), self.mem.name(symbol))
+            self.assertEqual(self.db.known(symbol), True)
+        self.assertEqual(self.db.symbol_at("src/lib.rs", 1, 8), self.mem.symbol_at("src/lib.rs", 1, 8))
+        self.assertIsNone(self.db.symbol_at("src/lib.rs", 1, 0))
+        self.assertFalse(self.db.known("rust-analyzer cargo std 1.0 lib/nothing()."))
 
 
 class Fingerprint(unittest.TestCase):

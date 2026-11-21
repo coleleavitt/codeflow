@@ -21,6 +21,7 @@ import bisect
 import hashlib
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -298,12 +299,12 @@ def cache_dir(root: Path) -> Path:
 
 
 def cached(root: Path) -> Path | None:
-    """The cached index of ``root`` when it matches the sources now, else None (no export is started)."""
+    """The cached database of ``root`` when it matches the sources now, else None (no export is started)."""
     root = root.resolve()
     directory = cache_dir(root)
-    index_path, stamp = directory / "index.scip", directory / "fingerprint"
-    if index_path.is_file() and stamp.is_file() and stamp.read_text().strip() == fingerprint(root):
-        return index_path
+    db_path, stamp = directory / "index.sqlite", directory / "fingerprint"
+    if db_path.is_file() and stamp.is_file() and stamp.read_text().strip() == fingerprint(root):
+        return db_path
     return None
 
 
@@ -329,27 +330,37 @@ def start_export(root: Path) -> bool:
 
 
 def export(root: Path, timeout: float = 900) -> Path:
-    """The workspace's SCIP index, from the cache when the sources have not changed, else a fresh
-    ``rust-analyzer scip`` run (written atomically). Raises ScipError on failure."""
+    """The workspace's SCIP index database (``_scip_db``), from the cache when the sources have not changed,
+    else a fresh ``rust-analyzer scip`` run whose export is read into the database and then discarded.
+    Written atomically; raises ScipError on failure."""
+    from . import _scip_db
+
     root = root.resolve()
     directory = cache_dir(root)
     digest = fingerprint(root)
-    index_path = directory / "index.scip"
+    db_path = directory / "index.sqlite"
     stamp = directory / "fingerprint"
-    if index_path.is_file() and stamp.is_file() and stamp.read_text().strip() == digest:
-        return index_path
+    if db_path.is_file() and stamp.is_file() and stamp.read_text().strip() == digest:
+        return db_path
     directory.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=directory, suffix=".scip", delete=False) as tmp:
-        temp = Path(tmp.name)
+    scip_tmp = _temp_in(directory, ".scip")
+    db_tmp = _temp_in(directory, ".sqlite")
     try:
-        subprocess.run(["rust-analyzer", "scip", str(root), "--output", str(temp)],
+        subprocess.run(["rust-analyzer", "scip", str(root), "--output", str(scip_tmp)],
                        cwd=root, capture_output=True, text=True, timeout=timeout, check=True)
-        if not temp.is_file() or temp.stat().st_size == 0:
+        if not scip_tmp.is_file() or scip_tmp.stat().st_size == 0:
             raise ScipError("rust-analyzer wrote no index")
-        Index.load(temp)  # refuse an index this reader cannot parse before it replaces the cached one
-        os.replace(temp, index_path)
+        _scip_db.build(scip_tmp, db_tmp)  # refuses an export it cannot read before a database replaces the old one
+        os.replace(db_tmp, db_path)
         stamp.write_text(digest + "\n")
-    except (OSError, subprocess.SubprocessError, ScipError) as error:
-        temp.unlink(missing_ok=True)
+    except (OSError, subprocess.SubprocessError, sqlite3.Error, ScipError) as error:
         raise ScipError(f"rust-analyzer scip failed for {root}: {error}") from error
-    return index_path
+    finally:
+        scip_tmp.unlink(missing_ok=True)
+        db_tmp.unlink(missing_ok=True)
+    return db_path
+
+
+def _temp_in(directory: Path, suffix: str) -> Path:
+    with tempfile.NamedTemporaryFile(dir=directory, suffix=suffix, delete=False) as handle:
+        return Path(handle.name)

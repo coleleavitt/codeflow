@@ -61,3 +61,39 @@ class Paths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DisplayedNumbers(unittest.TestCase):
+    """Internal ids are not the printed B-numbers: the translation keeps the printed ones everywhere the user sees."""
+
+    GRAPH = {
+        "entry": 7,
+        "blocks": [
+            {"id": "7", "succ": [{"to": 12, "label": ""}]},
+            {"id": "12", "succ": [{"to": 53, "label": ""}, {"to": 53, "label": "arm"}]},
+            {"id": "53", "succ": []},
+        ],
+        "names": {"7": "B0", "12": "B1", "53": "B2"},
+    }
+
+    def test_parse_accepts_b_prefixed_numbers(self):
+        self.assertEqual(_views.parse_block("B3"), 3)
+        self.assertEqual(_views.parse_block("3"), 3)
+        self.assertEqual(_views.parse_blocks("B1-B2,0"), {0, 1, 2})
+        with self.assertRaises(_views.ViewError):
+            _views.parse_block("x3")
+
+    def test_the_displayed_graph_renumbers_ids_and_edges(self):
+        out = _views.displayed(self.GRAPH)
+        self.assertEqual([b["id"] for b in out["blocks"]], ["0", "1", "2"])
+        self.assertEqual(out["blocks"][0]["succ"], [{"to": 1, "label": ""}])
+        self.assertEqual(out["entry"], 0)
+
+    def test_numbers_map_to_internal_ids_and_unknown_ones_are_reported(self):
+        ids, missing = _views.internal_ids(self.GRAPH, {0, 2, 9})
+        self.assertEqual(ids, {7, 53})
+        self.assertEqual(missing, [9])
+
+    def test_two_edges_to_one_block_give_one_path(self):
+        found, _ = _views.paths(self.GRAPH, 7, 53)
+        self.assertEqual(found, [[7, 12, 53]])

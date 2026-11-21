@@ -124,8 +124,8 @@ def parser() -> argparse.ArgumentParser:
     cfg.add_argument("--json", action="store_true", help="print {function, text, graph} as JSON")
     cfg.add_argument("--out", metavar="FILE", help="write the whole output to FILE (text, or JSON with --json) and print a summary")
     cfg.add_argument("--blocks", metavar="SPEC", help="only these blocks: 12-30, 3,5,9, or both")
-    cfg.add_argument("--path-from", dest="path_from", metavar="B", type=int, help="the paths from block B ...")
-    cfg.add_argument("--path-to", dest="path_to", metavar="B", type=int, help="... to block B (at most 50, shortest first)")
+    cfg.add_argument("--path-from", dest="path_from", metavar="B", help="the paths from block B (B3 or 3) ...")
+    cfg.add_argument("--path-to", dest="path_to", metavar="B", help="... to block B (at most 50, shortest first)")
     query = commands.add_parser("query", help="read-only SQL over a project's SCIP index (Rust): tables occ, names")
     query.add_argument("sql", help="one SELECT (or WITH ... SELECT) statement")
     query.add_argument("--root", metavar="DIR", help="a directory of the project (default: the current one)")
@@ -165,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = asyncio.run(_with_servers(run_cfg(args.target, function, vars(args))))
         graph_text, graph = apply_views(args, result)
+        for note in getattr(args, "_warnings", []):
+            print(f"codeflow: {note}", file=sys.stderr)
     except (LookupError, ValueError, FileNotFoundError, RuntimeError) as error:
         print(f"codeflow: {error}", file=sys.stderr)
         return 1
@@ -182,16 +184,61 @@ def apply_views(args: argparse.Namespace, result) -> tuple[str, dict]:
     """The text and graph to print: the whole result, or the --blocks range or the --path-from/--path-to paths."""
     from . import _cfg, _views
 
+    args._warnings = []
     if args.blocks is None and args.path_from is None and args.path_to is None:
-        return result.text, result.graph
-    graph = result.graph
+        return result.text, _views.displayed(result.graph)
+    graph = result.graph  # internal ids; every number the user sees or types is a displayed B-number
     if args.path_from is not None or args.path_to is not None:
         if args.path_from is None or args.path_to is None:
             raise ValueError("--path-from and --path-to go together")
-        found, more = _views.paths(graph, args.path_from, args.path_to)
-        return _views.render_paths(found, more, args.path_from, args.path_to), {"paths": found, "more": more}
-    sub = _views.subgraph(graph, _views.parse_blocks(args.blocks))
-    return _cfg.render(sub, Path.cwd()), sub
+        source, target = _views.parse_block(args.path_from), _views.parse_block(args.path_to)
+        mapping = _views.display_map(graph)
+        if source not in mapping or target not in mapping:
+            bad = source if source not in mapping else target
+            raise ValueError(f"B{bad} is not a block of this function")
+        found, more = _views.paths(graph, mapping[source], mapping[target])
+        shown = {internal: number for number, internal in mapping.items()}
+        displayed_paths = [[shown[b] for b in path] for path in found]
+        return _views.render_paths(displayed_paths, more, source, target), {"paths": displayed_paths, "more": more}
+    wanted = _views.parse_blocks(args.blocks)
+    ids, missing = _views.internal_ids(graph, wanted)
+    if missing:
+        args._warnings.append("not blocks of this function, skipped: " + ", ".join(f"B{n}" for n in missing))
+    sub = _views.subgraph(graph, ids)
+    return _cfg.render(sub, Path.cwd()), _views.displayed(sub)
+
+
+def locate_index(start: Path) -> tuple[Path | None, Path | None, str]:
+    """The Rust workspace a query means, and its current index: the workspace above ``start`` (as ``cfg``
+    finds it), else the one workspace under ``start`` (a git root holding it in a subdirectory) that has a
+    current index. Several candidates are named, not guessed between."""
+    from . import _lsp_client, _scip
+
+    above = _lsp_client._project_root(start / "query.rs")  # a directory: the workspace containing it, if any
+    if (above / "Cargo.toml").is_file() and "[workspace]" in (above / "Cargo.toml").read_text(errors="replace"):
+        db = _scip.cached(above)
+        if db is not None:
+            return above, db, ""
+        return above, None, f"no current SCIP index for {above}; a Rust cfg query in that workspace builds it"
+    workspaces = []
+    for manifest in start.rglob("Cargo.toml"):
+        parts = manifest.relative_to(start).parts
+        if len(parts) > 4 or any(p == "target" or p.startswith(".") for p in parts):
+            continue
+        text = manifest.read_text(errors="replace")
+        if "[workspace]" in text:
+            workspaces.append(manifest.parent)
+    cached = [(w, _scip.cached(w)) for w in workspaces]
+    cached = [(w, db) for w, db in cached if db is not None]
+    if len(cached) == 1:
+        return cached[0][0], cached[0][1], ""
+    if len(cached) > 1:
+        names = ", ".join(str(w.relative_to(start)) or "." for w, _ in cached)
+        return None, None, f"several workspaces under {start} have an index ({names}); pass --root one of them"
+    if workspaces:
+        names = ", ".join(str(w.relative_to(start)) or "." for w in workspaces)
+        return None, None, f"no current SCIP index under {start} (workspaces: {names}); a Rust cfg query there builds it"
+    return None, None, f"no Rust workspace under {start}"
 
 
 def run_query(args: argparse.Namespace) -> int:
@@ -205,11 +252,10 @@ def run_query(args: argparse.Namespace) -> int:
     if ";" in statement or not re.match(r"(?is)^(select|with)\b", statement):
         print("codeflow: query takes one SELECT (or WITH ... SELECT) statement", file=sys.stderr)
         return 1
-    # A directory has no suffix, so ask for a file inside it: the workspace (Cargo.toml) above it is found.
-    root = _lsp_client._project_root(Path(args.root or ".").expanduser().resolve() / "query.rs")
-    db_path = _scip.cached(root)
+    start = Path(args.root or ".").expanduser().resolve()
+    root, db_path, reason = locate_index(start)
     if db_path is None:
-        print(f"codeflow: no current SCIP index for {root}; a Rust cfg query there builds it", file=sys.stderr)
+        print(f"codeflow: {reason}", file=sys.stderr)
         return 1
     index = _scip_db.SqlIndex(db_path)
     try:

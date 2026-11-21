@@ -215,6 +215,14 @@ async def cfg(
     base = _root(file, root)
     notes, tail = await _annotations(file, simple, var, dominators)
     result = FlowGraph(str(graph["function"]), _cfg.render(simple, base, notes) + tail, simple)
+    outer = _enclosing_named(str(graph["function"])) if file.suffix == ".rs" else None
+    if outer is not None:
+        # A line inside a closure: the closure's graph, then the whole graph of the function it is written in.
+        whole = _cfg.simplify(await _build(file, outer, level, cleanup), cleanup=cleanup)
+        notes_whole, tail_whole = await _annotations(file, whole, var, dominators)
+        header = f"{outer}  (the function around the closure)"
+        result.text = f"{_cfg.render(whole, base, notes_whole) + tail_whole}\n\n{result.text}"
+        result.text = f"{header}\n{result.text}"
     if note:
         result.text = f"note: {note}\n{result.text}"
     if refs_text is not None:
@@ -964,3 +972,9 @@ def _scip_note(error: Exception) -> None:
     import sys
 
     print(f"codeflow: SCIP index unavailable ({str(error).splitlines()[0][:200]}); using the language server", file=sys.stderr)
+
+
+def _enclosing_named(function: str) -> str | None:
+    """A Rust closure's enclosing function: ``a::b::f::{closure#5}`` -> ``a::b::f``; None for anything else."""
+    head, marker, _ = function.partition("::{closure#")
+    return head if marker and head else None

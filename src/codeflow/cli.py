@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import json
 import re
+import sqlite3
 import subprocess
 import sys
 import types

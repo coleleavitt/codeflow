@@ -70,6 +70,14 @@ def _rust_checkout_env(workspace: pathlib.Path) -> dict[str, str]:
     }
 
 
+def _mir_target(workspace: pathlib.Path) -> pathlib.Path:
+    """codeflow's MIR build directory for one workspace, under the user's cache (one per workspace)."""
+    import hashlib
+
+    base = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache")
+    return base / "codeflow" / "mir" / hashlib.sha256(str(workspace).encode()).hexdigest()[:16]
+
+
 def rust_cfg(file: pathlib.Path, function: str | int) -> dict:
     """The MIR control-flow graph of `function` defined in `file`: a name or path suffix (closures as
     `outer::{closure#0}`), or a 1-based line, which picks the innermost fn, closure or async block around it."""
@@ -87,7 +95,9 @@ def rust_cfg(file: pathlib.Path, function: str | int) -> dict:
             "CODEFLOW_LINE" if isinstance(function, int) or re.fullmatch(r"\d+:\d+", str(function)) else "CODEFLOW_FN": str(function),
             "CODEFLOW_FILE": str(file),
             "CODEFLOW_OUT": str(out),
-            "CARGO_TARGET_DIR": str(workspace / "target" / "codeflow"),
+            # The MIR driver's build lives in codeflow's cache, never in the project's target/ or the user's
+            # CARGO_TARGET_DIR: its own rustc driver would invalidate their builds. CODEFLOW_TARGET_DIR overrides.
+            "CARGO_TARGET_DIR": os.environ.get("CODEFLOW_TARGET_DIR") or str(_mir_target(workspace)),
         } | _rust_checkout_env(workspace)
         cmd = ["cargo", TOOLCHAIN, "rustc", "-p", package, *_target(file, package_dir, package), "--profile", "check"]
         _run([*cmd, "--", "--cfg", f"codeflow_probe_{uuid.uuid4().hex[:12]}"], workspace, env)
